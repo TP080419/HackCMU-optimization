@@ -56,6 +56,7 @@ Gel + Biofiber → Terraform Core
 - 机器有真实输入 / 输出缓存，不能直接从相邻 Belt 吸取物品。
 - Inserter 是机器和物流之间唯一的自动搬运方式。
 - Belt 以两个独立通道运输逐个物品。
+- 玩家拖出的直角 Belt 会按方向自动接线；自由建造的 Inserter 从背面取料、向正面投料，Hopper 可作为中间缓存。
 
 ## 五步章节
 
@@ -113,12 +114,13 @@ while True:
 - 工作台统计各行执行成本，Flow Vision 显示最耗时三行；
 - 点击机器才打开上下文卡片。
 
-Benchmark 复制当前完整状态，分别从相同 tick 运行固定巡逻基线和当前程序 120 模拟秒。它比较 Core/min、空载移动、Xenograin 格距、两台机器缺料、Belt 堵塞与能耗，不修改正式存档。测试门槛要求需求驱动程序至少提高 15% 产量并减少 20% 空载移动。
+Benchmark 首次打开时锁定当前完整状态，分别从同一 tick 运行固定巡逻基线和当前程序 120 模拟秒；修改代码后仍复用原快照，只有点击“更新基准快照”才重新取样。它比较 Core/min、空载移动、Xenograin 格距、两台机器缺料、Belt 堵塞与能耗，不修改正式存档。测试门槛要求需求驱动程序至少提高 15% 产量并减少 20% 空载移动。
 
 ## 架构
 
 - React 19：菜单、悬浮 HUD、任务、建造栏、设置、Benchmark 与 CodeMirror 抽屉。
-- Phaser 4.2.1：100dvw × 100dvh 世界、等距镜头、WebGL / Canvas fallback、输入、实体动画与本地音频反馈。
+- Phaser 4.2.1：100dvw × 100dvh 世界、等距镜头、WebGL / Canvas fallback、输入与实体动画。
+- Web Audio：只在玩家手势后启动本地合成环境声、机器节奏与操作反馈，并遵循静音 / 音量设置。
 - 纯 TypeScript 模拟：严格 100ms 固定步长，不使用 Phaser 物理引擎。
 - Vitest：V1 回归、V2 解释器、确定性、存档、优化门槛与 300 Belt / 600 物品压力场景。
 

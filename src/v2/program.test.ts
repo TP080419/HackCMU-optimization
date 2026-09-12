@@ -45,4 +45,21 @@ describe('safe Python-like runtime', () => {
     expect(runtime.mode).toBe('error')
     expect(runtime.lastError).toContain('递归')
   })
+
+  it('lets cooperative while loops run indefinitely while still rejecting busy loops', () => {
+    const cooperative = createProgramRuntime('while True:\n    wait(0.1)')
+    cooperative.mode = 'running'
+    for (let index = 0; index < 10_050; index += 1) {
+      expect(executeProgram(cooperative, context)?.name).toBe('wait')
+      resumeProgramAfterAction(cooperative)
+    }
+    expect(cooperative.mode).toBe('running')
+    expect(cooperative.lastError).toBeNull()
+
+    const busy = createProgramRuntime('while True:\n    value = 1')
+    busy.mode = 'running'
+    expect(executeProgram(busy, context)).toBeNull()
+    expect(busy.mode).toBe('error')
+    expect(busy.lastError).toContain('死循环')
+  })
 })

@@ -1,6 +1,6 @@
 import Phaser from 'phaser'
 import { ITEM_COLORS, MAP_HEIGHT, MAP_WIDTH, TILE_HEIGHT, TILE_WIDTH } from '../config'
-import type { EntityKind, GameCommand, GridPoint, ItemId, RenderEntity, RenderSnapshot } from '../types'
+import type { Direction, EntityKind, GameCommand, GridPoint, ItemId, RenderEntity, RenderSnapshot } from '../types'
 
 const ORIGIN_X = 1_020
 const ORIGIN_Y = 120
@@ -50,6 +50,7 @@ export class FactoryScene extends Phaser.Scene {
   private lastClickAt = 0
   private lastClickedId = ''
   private currentTick = -1
+  private lastDrawAt = Number.NEGATIVE_INFINITY
   private movingEntityId: string | null = null
   private buildStart: GridPoint | null = null
 
@@ -74,6 +75,14 @@ export class FactoryScene extends Phaser.Scene {
       this.currentTick = snapshot.tick
       this.lastSnapshot = snapshot
     }
+    // The acceptance stress scene can contain 600 independently moving belt
+    // items. Keep input and Phaser's RAF loop responsive while drawing that
+    // dense world at a deliberate, stable 30 fps cadence. Normal Sector 01
+    // remains unthrottled.
+    const movingItems = this.lastSnapshot.entities.reduce((total, entity) => total + (entity.beltItems?.length ?? 0), 0)
+    const minimumFrameMs = movingItems >= 400 ? 1000 / 30 : 0
+    if (time - this.lastDrawAt < minimumFrameMs) return
+    this.lastDrawAt = time
     this.drawWorld(this.lastSnapshot, this.lastSnapshot.settings.reducedMotion ? 0 : time)
   }
 
@@ -140,9 +149,14 @@ export class FactoryScene extends Phaser.Scene {
         if (tool === 'belt') {
           const start = this.buildStart
           const stepX = grid.x >= start.x ? 1 : -1
-          for (let x = start.x; x !== grid.x + stepX; x += stepX) this.bridge.dispatch({ type: 'build', kind: tool, x, y: start.y })
           const stepY = grid.y >= start.y ? 1 : -1
-          for (let y = start.y + stepY; y !== grid.y + stepY; y += stepY) this.bridge.dispatch({ type: 'build', kind: tool, x: grid.x, y })
+          const horizontal: Direction = stepX > 0 ? 'east' : 'west'
+          const vertical: Direction = stepY > 0 ? 'south' : 'north'
+          for (let x = start.x; x !== grid.x + stepX; x += stepX) {
+            const turnsAtCorner = x === grid.x && grid.y !== start.y
+            this.bridge.dispatch({ type: 'build', kind: tool, x, y: start.y, direction: turnsAtCorner ? vertical : horizontal })
+          }
+          for (let y = start.y + stepY; y !== grid.y + stepY; y += stepY) this.bridge.dispatch({ type: 'build', kind: tool, x: grid.x, y, direction: vertical })
         } else this.bridge.dispatch({ type: 'build', kind: tool, x: grid.x, y: grid.y })
         this.buildStart = null
         return
@@ -307,20 +321,39 @@ export class FactoryScene extends Phaser.Scene {
   }
 
   private drawBelt(entity: RenderEntity, center: GridPoint, time: number) {
+    const movement: GridPoint = entity.direction === 'east'
+      ? { x: 1, y: 0.24 }
+      : entity.direction === 'west'
+        ? { x: -1, y: -0.24 }
+        : entity.direction === 'south'
+          ? { x: -1, y: 0.24 }
+          : { x: 1, y: -0.24 }
+    const across = { x: -movement.y * 7.5, y: movement.x }
     this.diamond(this.world, center.x, center.y, 86, 40, 0x313b38, 1, 0xb77845)
     this.world.lineStyle(2.2, 0xd08d52, 0.9)
-    this.world.lineBetween(center.x - 34, center.y - 10, center.x + 34, center.y + 7)
-    this.world.lineBetween(center.x - 34, center.y - 2, center.x + 34, center.y + 15)
+    for (const lane of [-4, 4]) {
+      this.world.lineBetween(
+        center.x - movement.x * 34 + across.x * lane,
+        center.y - movement.y * 34 + across.y * lane,
+        center.x + movement.x * 34 + across.x * lane,
+        center.y + movement.y * 34 + across.y * lane,
+      )
+    }
     for (let index = -2; index <= 2; index += 1) {
       const offset = ((time * 0.025 + index * 17) % 66) - 33
       this.world.lineStyle(1.5, 0x8a9690, 0.5)
-      this.world.lineBetween(center.x + offset, center.y - 8 + offset * 0.24, center.x + offset - 5, center.y + 6 + offset * 0.24)
+      this.world.lineBetween(
+        center.x + movement.x * offset - across.x * 5,
+        center.y + movement.y * offset - across.y * 5,
+        center.x + movement.x * offset + across.x * 5,
+        center.y + movement.y * offset + across.y * 5,
+      )
     }
     for (const item of entity.beltItems ?? []) {
       const along = (item.progress - 0.5) * 66
       const laneOffset = item.lane === 0 ? -5 : 5
-      const x = center.x + along - laneOffset * 1.8
-      const y = center.y + along * 0.24 + laneOffset - 8
+      const x = center.x + movement.x * along + across.x * laneOffset
+      const y = center.y + movement.y * along + across.y * laneOffset - 8
       this.world.fillStyle(0x101816, 0.4)
       this.world.fillEllipse(x + 2, y + 4, 15, 8)
       this.world.fillStyle(itemColor(item.item), 1)
@@ -578,6 +611,24 @@ export class FactoryScene extends Phaser.Scene {
   }
 
   private drawWorldFeedback(snapshot: RenderSnapshot) {
+    for (const event of snapshot.events) {
+      if (event.type !== 'worldEdited' || event.action === 'program') continue
+      const age = snapshot.tick - event.tick
+      if (age < 0 || age > 12) continue
+      const entity = event.entityId ? snapshot.entities.find((candidate) => candidate.id === event.entityId) : undefined
+      const x = entity ? entity.x + entity.width / 2 : event.x === undefined ? undefined : event.x + 0.5
+      const y = entity ? entity.y + entity.height / 2 : event.y === undefined ? undefined : event.y + 0.5
+      if (x === undefined || y === undefined) continue
+      const center = iso({ x, y })
+      const progress = snapshot.settings.reducedMotion ? 0.25 : age / 12
+      const color = event.action === 'demolish' ? 0xff806f : event.action === 'rotate' ? 0x89d9ff : 0xb8f27a
+      this.effects.lineStyle(4 * (1 - progress), color, 0.9 * (1 - progress))
+      this.effects.strokeEllipse(center.x, center.y - 7, 36 + progress * 58, 18 + progress * 29)
+      if (event.action === 'build') {
+        this.effects.fillStyle(color, 0.14 * (1 - progress))
+        this.effects.fillEllipse(center.x, center.y - 7, 30 + progress * 35, 15 + progress * 18)
+      }
+    }
     const delivery = [...snapshot.events].reverse().find((event) => event.type === 'coreDelivered')
     if (!delivery) return
     const age = snapshot.tick - delivery.tick
@@ -612,7 +663,7 @@ export class FactoryScene extends Phaser.Scene {
   private updateLabels(snapshot: RenderSnapshot) {
     const visible = new Set<string>()
     for (const entity of snapshot.entities) {
-      const meteredBelt = snapshot.flowVision && (/-(belt)-16$/.test(entity.id) || entity.id === 'core-belt-25')
+      const meteredBelt = snapshot.flowVision && entity.kind === 'belt'
       if (!entity.selected && !(snapshot.flowVision && ['gelRefinery', 'fiberMill', 'coreAssembler', 'uplink'].includes(entity.kind)) && !meteredBelt) continue
       visible.add(entity.id)
       let label = this.labels.get(entity.id)
@@ -629,8 +680,7 @@ export class FactoryScene extends Phaser.Scene {
       }
       const center = iso({ x: entity.x + entity.width / 2, y: entity.y + entity.height / 2 })
       const status = entity.status === 'starved' ? ' · 缺料' : entity.status === 'blocked' ? ' · 堵塞' : ''
-      const movingRate = Math.round((entity.beltItems?.length ?? 0) * (60 / 1.35))
-      label.setText(meteredBelt ? `${movingRate} items/min` : `${entity.name}${status}`).setPosition(center.x, center.y - entity.height * 45 - 42).setVisible(true)
+      label.setText(meteredBelt ? `${Math.round(entity.itemsPerMinute ?? 0)} items/min` : `${entity.name}${status}`).setPosition(center.x, center.y - entity.height * 45 - 42).setVisible(true)
     }
     for (const [id, label] of this.labels) if (!visible.has(id)) label.setVisible(false)
   }

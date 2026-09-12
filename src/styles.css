@@ -315,7 +315,7 @@ input:focus-visible {
 }
 
 .resource-strip b {
-  font: 750 16px "Cascadia Code", monospace;
+  font: 750 18px "Cascadia Code", monospace;
 }
 
 .sim-controls {
@@ -409,7 +409,7 @@ input:focus-visible {
 
 .objective-card h2 {
   margin: 4px 0 3px;
-  font-size: 16px;
+  font-size: 18px;
   font-weight: 730;
   line-height: 1.28;
 }
@@ -417,7 +417,7 @@ input:focus-visible {
 .objective-card p {
   margin: 0;
   color: #aebeb6;
-  font-size: 12px;
+  font-size: 14px;
   line-height: 1.5;
 }
 
@@ -427,7 +427,7 @@ input:focus-visible {
   padding: 7px 11px;
   border-color: #b9e970a3;
   color: #dff6ae;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 800;
 }
 
@@ -582,7 +582,7 @@ kbd {
 .context-card h3 {
   overflow: hidden;
   margin: 2px 0 0;
-  font-size: 16px;
+  font-size: 18px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -615,14 +615,14 @@ kbd {
 }
 
 .context-stats b {
-  font: 750 13px "Cascadia Code", monospace;
+  font: 750 18px "Cascadia Code", monospace;
   text-transform: uppercase;
 }
 
 .context-card p {
   margin: 10px 0 0;
   color: #b3c3ba;
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .context-card footer {
@@ -651,7 +651,7 @@ kbd {
 
 .flow-card header strong {
   color: #e8fff7;
-  font: 800 16px "Cascadia Code", monospace;
+  font: 800 18px "Cascadia Code", monospace;
 }
 
 .flow-metrics {
@@ -659,7 +659,7 @@ kbd {
   gap: 8px;
   margin-top: 12px;
   color: #b9cbc2;
-  font-size: 11px;
+  font-size: 14px;
 }
 
 .flow-metrics span {
@@ -681,7 +681,7 @@ kbd {
   padding-top: 9px;
   border-top: 1px solid #52655c52;
   color: #8ea299;
-  font: 10px/1.5 "Cascadia Code", monospace;
+  font: 12px/1.5 "Cascadia Code", monospace;
 }
 
 .build-dock {
@@ -920,6 +920,7 @@ kbd {
 
 .runtime-summary {
   display: flex;
+  flex-wrap: wrap;
   gap: 18px;
   color: #789086;
   font: 700 9px "Cascadia Code", monospace;
@@ -927,6 +928,10 @@ kbd {
 
 .runtime-summary strong {
   color: #c7d6ce;
+}
+
+.runtime-summary span:last-child {
+  flex-basis: 100%;
 }
 
 .sensor-readout,
@@ -984,6 +989,27 @@ kbd {
   margin: 12px 0;
   color: #a9bbb2;
   line-height: 1.55;
+}
+
+.benchmark-snapshot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border: 1px solid #4e6258;
+  border-radius: 7px;
+  color: #8fe8ce;
+  background: #101714;
+  font: 700 10px "Cascadia Code", monospace;
+}
+
+.benchmark-snapshot button {
+  min-height: 30px;
+  padding: 0 9px;
+  color: #dce8e1;
+  font: 750 11px system-ui, sans-serif;
 }
 
 .benchmark-summary {

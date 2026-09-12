@@ -2,7 +2,7 @@ import { Component, Suspense, lazy, useCallback, useEffect, useMemo, useRef, use
 import { benchmarkImprovement, runBenchmark } from './v2/benchmark'
 import { BASELINE_PROGRAM, LOOP_PROGRAM, PHASES, STARTER_PROGRAM, UNLOCKED_BUILDINGS_BY_PHASE } from './v2/config'
 import { XenoFlowEngine } from './v2/engine'
-import { loadGame, saveGame } from './v2/save'
+import { loadGame, loadSettings, saveGame } from './v2/save'
 import { cloneState, createInitialState } from './v2/simulation'
 import type { BenchmarkResult, EntityKind, ItemId, SimulationEvent, SimulationStateV2 } from './v2/types'
 
@@ -82,6 +82,9 @@ function eventTone(event: SimulationEvent) {
   if (event.type === 'phaseAdvanced') return [520, 0.28] as const
   if (event.type === 'machineCycle') return [220, 0.08] as const
   if (event.type === 'droneAction' && event.action === 'harvest') return [360, 0.07] as const
+  if (event.type === 'worldEdited' && event.action === 'build') return [300, 0.06] as const
+  if (event.type === 'worldEdited' && event.action === 'rotate') return [410, 0.05] as const
+  if (event.type === 'worldEdited' && event.action === 'demolish') return [150, 0.08] as const
   return null
 }
 
@@ -128,12 +131,14 @@ function LaunchScreen({ hasSave, onStart, onContinue }: { hasSave: boolean; onSt
 interface BenchmarkPanelProps {
   baseline: BenchmarkResult | null
   candidate: BenchmarkResult | null
+  snapshotTick: number | null
   running: boolean
   onClose: () => void
   onRun: () => void
+  onCapture: () => void
 }
 
-function BenchmarkPanel({ baseline, candidate, running, onClose, onRun }: BenchmarkPanelProps) {
+function BenchmarkPanel({ baseline, candidate, snapshotTick, running, onClose, onRun, onCapture }: BenchmarkPanelProps) {
   const improvement = baseline && candidate ? benchmarkImprovement(baseline, candidate) : null
   const rows: Array<[string, keyof BenchmarkResult, string]> = [
     ['Core / min', 'coresPerMinute', '越高越好'],
@@ -151,6 +156,10 @@ function BenchmarkPanel({ baseline, candidate, running, onClose, onRun }: Benchm
         <button className="icon-button" type="button" onClick={onClose}>×</button>
       </header>
       <p>复制当前世界，从完全相同的 tick 分别运行基线与当前程序；不会修改正式存档。</p>
+      <div className="benchmark-snapshot">
+        <span>LOCKED SNAPSHOT // TICK {snapshotTick ?? '—'}</span>
+        <button type="button" disabled={running} onClick={onCapture}>更新基准快照</button>
+      </div>
       <div className="benchmark-summary">
         <div><span>产量变化</span><strong>{improvement ? `${improvement.outputGain >= 0 ? '+' : ''}${improvement.outputGain}%` : '—'}</strong></div>
         <div><span>空载减少</span><strong>{improvement ? `${improvement.emptyReduction >= 0 ? '+' : ''}${improvement.emptyReduction}%` : '—'}</strong></div>
@@ -172,7 +181,12 @@ function BenchmarkPanel({ baseline, candidate, running, onClose, onRun }: Benchm
 
 function App() {
   const savedAtBoot = useMemo(() => loadGame(), [])
-  const engine = useMemo(() => new XenoFlowEngine(savedAtBoot ?? createInitialState()), [savedAtBoot])
+  const settingsAtBoot = useMemo(() => loadSettings(), [])
+  const engine = useMemo(() => {
+    const initial = savedAtBoot ?? createInitialState()
+    initial.settings = { ...settingsAtBoot }
+    return new XenoFlowEngine(initial)
+  }, [savedAtBoot, settingsAtBoot])
   const [revision, setRevision] = useState(0)
   const [entered, setEntered] = useState(false)
   const [codeOpen, setCodeOpen] = useState(false)
@@ -181,12 +195,18 @@ function App() {
   const [benchmarkRunning, setBenchmarkRunning] = useState(false)
   const [baseline, setBaseline] = useState<BenchmarkResult | null>(null)
   const [candidate, setCandidate] = useState<BenchmarkResult | null>(null)
+  const [benchmarkTick, setBenchmarkTick] = useState<number | null>(null)
   const [buildTool, setBuildTool] = useState<EntityKind | null>(null)
   const [codeSource, setCodeSource] = useState(engine.getState().runtime.source)
   const [insertion, setInsertion] = useState<{ name: string; nonce: number } | null>(null)
   const [toast, setToast] = useState('')
-  const lastEventId = useRef('')
+  // A restored save may contain historical events. Mark its newest event as
+  // already observed so the launch screen never creates audio without a user
+  // gesture or replays an old completion sound.
+  const lastEventId = useRef(engine.getState().events.at(-1)?.id ?? '')
   const audioRef = useRef<AudioContext | null>(null)
+  const ambientRef = useRef<{ oscillators: OscillatorNode[]; gain: GainNode } | null>(null)
+  const benchmarkSnapshotRef = useRef<SimulationStateV2 | null>(null)
   const state = engine.getState()
   void revision
 
@@ -228,7 +248,62 @@ function App() {
     oscillator.stop(audio.currentTime + duration)
   }, [engine])
 
+  const startAmbient = useCallback(() => {
+    const current = engine.getState()
+    const AudioCtor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+    if (!AudioCtor) return
+    const audio = audioRef.current ?? new AudioCtor()
+    audioRef.current = audio
+    void audio.resume()
+    if (ambientRef.current) return
+    const filter = audio.createBiquadFilter()
+    const gain = audio.createGain()
+    filter.type = 'lowpass'
+    filter.frequency.value = 190
+    gain.gain.value = current.settings.muted ? 0 : current.settings.volume * 0.012
+    const oscillators = [48, 72].map((frequency, index) => {
+      const oscillator = audio.createOscillator()
+      oscillator.type = index === 0 ? 'sine' : 'triangle'
+      oscillator.frequency.value = frequency
+      oscillator.detune.value = index === 0 ? -4 : 5
+      oscillator.connect(filter)
+      oscillator.start()
+      return oscillator
+    })
+    filter.connect(gain).connect(audio.destination)
+    ambientRef.current = { oscillators, gain }
+  }, [engine])
+
   useEffect(() => {
+    const ambient = ambientRef.current
+    const audio = audioRef.current
+    if (!ambient || !audio) return
+    ambient.gain.gain.setTargetAtTime(state.settings.muted ? 0 : state.settings.volume * 0.012, audio.currentTime, 0.08)
+  }, [state.settings.muted, state.settings.volume])
+
+  useEffect(() => () => {
+    for (const oscillator of ambientRef.current?.oscillators ?? []) oscillator.stop()
+    ambientRef.current = null
+    if (audioRef.current) void audioRef.current.close()
+    audioRef.current = null
+  }, [])
+
+  const captureBenchmarkSnapshot = useCallback(() => {
+    const snapshot = cloneState(engine.getState())
+    benchmarkSnapshotRef.current = snapshot
+    setBenchmarkTick(snapshot.tick)
+    setBaseline(null)
+    setCandidate(null)
+  }, [engine])
+
+  const toggleBenchmark = useCallback(() => {
+    if (engine.getState().mission.phase < 4) return
+    if (!benchmarkOpen && !benchmarkSnapshotRef.current) captureBenchmarkSnapshot()
+    setBenchmarkOpen((open) => !open)
+  }, [benchmarkOpen, captureBenchmarkSnapshot, engine])
+
+  useEffect(() => {
+    if (!entered) return
     const event = state.events[state.events.length - 1]
     if (!event || event.id === lastEventId.current) return
     lastEventId.current = event.id
@@ -240,7 +315,7 @@ function App() {
       const timer = window.setTimeout(() => setToast(''), 3_800)
       return () => window.clearTimeout(timer)
     }
-  }, [playTone, state.events])
+  }, [entered, playTone, state.events])
 
   useEffect(() => {
     const selected = state.entities.find((entity) => entity.id === state.selectedEntityId)
@@ -256,24 +331,31 @@ function App() {
         setBuildTool(null)
         setSettingsOpen(false)
       }
-      if (!typing && event.key.toLowerCase() === 'b' && !event.ctrlKey && !event.metaKey && engine.getState().mission.phase >= 4) setBenchmarkOpen((open) => !open)
+      if (!typing && event.key.toLowerCase() === 'b' && !event.ctrlKey && !event.metaKey) toggleBenchmark()
     }
     window.addEventListener('keydown', keydown)
     return () => window.removeEventListener('keydown', keydown)
-  }, [engine])
+  }, [toggleBenchmark])
 
   const startFresh = () => {
     const fresh = createInitialState(STARTER_PROGRAM)
+    fresh.settings = { ...engine.getState().settings }
     engine.dispatch({ type: 'loadState', state: fresh })
     saveGame(fresh)
+    benchmarkSnapshotRef.current = null
+    setBenchmarkTick(null)
+    setBaseline(null)
+    setCandidate(null)
     setCodeSource(STARTER_PROGRAM)
     setEntered(true)
+    startAmbient()
     playTone(440, 0.16)
   }
 
   const continueGame = () => {
     setEntered(true)
     setCodeSource(engine.getState().runtime.source)
+    startAmbient()
     playTone(440, 0.16)
   }
 
@@ -298,12 +380,21 @@ function App() {
   const runBenchmarks = () => {
     setBenchmarkRunning(true)
     window.setTimeout(() => {
-      const snapshot = cloneState(engine.getState())
+      const snapshot = benchmarkSnapshotRef.current ?? cloneState(engine.getState())
+      if (!benchmarkSnapshotRef.current) {
+        benchmarkSnapshotRef.current = snapshot
+        setBenchmarkTick(snapshot.tick)
+      }
       setBaseline(runBenchmark(snapshot, BASELINE_PROGRAM))
       setCandidate(runBenchmark(snapshot, codeSource))
       setBenchmarkRunning(false)
       playTone(620, 0.16)
     }, 20)
+  }
+
+  const setSetting = (key: 'muted' | 'volume' | 'reducedMotion', value: boolean | number) => {
+    engine.dispatch({ type: 'setSetting', key, value })
+    saveGame(engine.getState())
   }
 
   const toggleFullscreen = async () => {
@@ -355,7 +446,7 @@ function App() {
 
         <nav className="world-tools" aria-label="World tools">
           <button className={state.flowVision ? 'active' : ''} type="button" onClick={() => engine.dispatch({ type: 'toggleFlowVision' })}><span>⌁</span>Flow Vision <kbd>Tab</kbd></button>
-          <button className={benchmarkOpen ? 'active' : ''} type="button" disabled={state.mission.phase < 4} title={state.mission.phase < 4 ? '接通工厂后解锁' : '从相同快照比较程序'} onClick={() => setBenchmarkOpen((open) => !open)}><span>◫</span>Benchmark <kbd>B</kbd></button>
+          <button className={benchmarkOpen ? 'active' : ''} type="button" disabled={state.mission.phase < 4} title={state.mission.phase < 4 ? '接通工厂后解锁' : '从相同快照比较程序'} onClick={toggleBenchmark}><span>◫</span>Benchmark <kbd>B</kbd></button>
           <button className={codeOpen ? 'active' : ''} type="button" onClick={() => setCodeOpen((open) => !open)}><span>{'</>'}</span>Code <kbd>C</kbd></button>
           <button type="button" onClick={() => void toggleFullscreen()} aria-label="切换全屏">⛶</button>
           <button type="button" onClick={() => setSettingsOpen((open) => !open)} aria-label="打开设置">⚙</button>
@@ -364,9 +455,9 @@ function App() {
         {settingsOpen && (
           <section className="settings-popover">
             <header><span className="eyebrow">LOCAL SETTINGS</span><button className="icon-button" type="button" onClick={() => setSettingsOpen(false)}>×</button></header>
-            <label><span>音量</span><input type="range" min="0" max="1" step="0.05" value={state.settings.volume} onChange={(event) => engine.dispatch({ type: 'setSetting', key: 'volume', value: Number(event.target.value) })} /></label>
-            <label><span>静音</span><input type="checkbox" checked={state.settings.muted} onChange={(event) => engine.dispatch({ type: 'setSetting', key: 'muted', value: event.target.checked })} /></label>
-            <label><span>Reduced motion</span><input type="checkbox" checked={state.settings.reducedMotion} onChange={(event) => engine.dispatch({ type: 'setSetting', key: 'reducedMotion', value: event.target.checked })} /></label>
+            <label><span>音量</span><input type="range" min="0" max="1" step="0.05" value={state.settings.volume} onChange={(event) => setSetting('volume', Number(event.target.value))} /></label>
+            <label><span>静音</span><input type="checkbox" checked={state.settings.muted} onChange={(event) => setSetting('muted', event.target.checked)} /></label>
+            <label><span>Reduced motion</span><input type="checkbox" checked={state.settings.reducedMotion} onChange={(event) => setSetting('reducedMotion', event.target.checked)} /></label>
             <small>设置与游戏存档只保存在本浏览器的 xenoflow.v2.* 命名空间。</small>
           </section>
         )}
@@ -422,6 +513,7 @@ function App() {
           <CodeWorkbench
             source={codeSource}
             runtime={state.runtime}
+            drone={state.drone}
             insertion={insertion}
             onChange={setCodeSource}
             onRun={runCode}
@@ -432,7 +524,7 @@ function App() {
           />
         </Suspense>
       )}
-      {benchmarkOpen && <BenchmarkPanel baseline={baseline} candidate={candidate} running={benchmarkRunning} onClose={() => setBenchmarkOpen(false)} onRun={runBenchmarks} />}
+      {benchmarkOpen && <BenchmarkPanel baseline={baseline} candidate={candidate} snapshotTick={benchmarkTick} running={benchmarkRunning} onClose={() => setBenchmarkOpen(false)} onRun={runBenchmarks} onCapture={captureBenchmarkSnapshot} />}
     </main>
   )
 }

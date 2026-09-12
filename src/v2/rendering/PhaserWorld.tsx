@@ -39,7 +39,10 @@ export function PhaserWorld({ engine, buildTool, onToggleCode, onReady }: Phaser
       render: { antialias: true, pixelArt: false, roundPixels: true },
       scale: { mode: Phaser.Scale.RESIZE, autoCenter: Phaser.Scale.CENTER_BOTH },
       scene,
-      audio: { disableWebAudio: false },
+      // Audio feedback is synthesized by React after an explicit user gesture.
+      // Keep Phaser's unused sound manager disabled so it never creates an
+      // autoplay-blocked AudioContext during the lazy scene mount.
+      audio: { noAudio: true },
     })
     return () => game.destroy(true)
   }, [engine])

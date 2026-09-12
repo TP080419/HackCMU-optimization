@@ -26,6 +26,8 @@ export function loadGame(storage: Pick<Storage, 'getItem'> = localStorage): Simu
   try {
     const envelope = JSON.parse(raw) as Partial<SaveEnvelope>
     if (envelope.schema !== 2 || !isV2State(envelope.state)) return null
+    // Forward-fill metrics added within V2 while leaving all V1 keys untouched.
+    envelope.state.metrics.xenograinDelivered ??= 0
     return envelope.state
   } catch {
     return null

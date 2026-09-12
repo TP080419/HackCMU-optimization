@@ -177,6 +177,7 @@ export function createInitialState(source = STARTER_PROGRAM): SimulationStateV2 
       powerStableMs: 0,
       totalElapsedMs: 0,
       xenograinDistance: 0,
+      xenograinDelivered: 0,
     },
     runtime: createProgramRuntime(source),
     events: [],
@@ -186,6 +187,42 @@ export function createInitialState(source = STARTER_PROGRAM): SimulationStateV2 
 
 function findEntity(state: SimulationStateV2, idOrName: string) {
   return state.entities.find((candidate) => candidate.id === idOrName || candidate.name === idOrName)
+}
+
+const DIRECTION_VECTOR: Record<Direction, GridPoint> = {
+  north: { x: 0, y: -1 },
+  east: { x: 1, y: 0 },
+  south: { x: 0, y: 1 },
+  west: { x: -1, y: 0 },
+}
+
+function entityAt(state: SimulationStateV2, x: number, y: number, excludeId?: string) {
+  return state.entities.find((candidate) => candidate.id !== excludeId && x >= candidate.x && x < candidate.x + candidate.width && y >= candidate.y && y < candidate.y + candidate.height)
+}
+
+function adjacentEntity(state: SimulationStateV2, origin: EntityV2, forward = true) {
+  const vector = DIRECTION_VECTOR[origin.direction]
+  const sign = forward ? 1 : -1
+  return entityAt(state, origin.x + vector.x * sign, origin.y + vector.y * sign, origin.id)
+}
+
+function isLogisticsTarget(candidate: EntityV2 | undefined) {
+  return Boolean(candidate && ['belt', 'inserter', 'hopper'].includes(candidate.kind))
+}
+
+function refreshAutoConnections(state: SimulationStateV2) {
+  for (const candidate of state.entities) {
+    if (!candidate.autoConnect) continue
+    if (candidate.kind === 'belt') {
+      const target = adjacentEntity(state, candidate)
+      candidate.targetId = isLogisticsTarget(target) ? target?.id : undefined
+    } else if (candidate.kind === 'inserter') {
+      const source = adjacentEntity(state, candidate, false)
+      const target = adjacentEntity(state, candidate)
+      candidate.sourceId = source && !['crop', 'ruin', 'inserter'].includes(source.kind) ? source.id : undefined
+      candidate.targetId = target && !['crop', 'ruin', 'belt', 'inserter'].includes(target.kind) ? target.id : target?.kind === 'hopper' ? target.id : undefined
+    }
+  }
 }
 
 function emit(state: SimulationStateV2, event: SimulationEventPayload) {
@@ -242,9 +279,32 @@ function validateNumber(value: ProgramValue, line: number, label: string) {
   return value
 }
 
+const SENSOR_UNLOCK_PHASE: Record<string, number> = {
+  farm_zone: 2,
+  is_ripe: 2,
+  cargo_free: 2,
+  cargo: 2,
+  distance_to: 2,
+  need: 4,
+}
+
+const ACTION_UNLOCK_PHASE: Record<string, number> = {
+  move_to: 1,
+  harvest: 1,
+  unload: 1,
+  plant: 2,
+  load: 2,
+  wait: 2,
+}
+
+function requireApiPhase(state: SimulationStateV2, name: string, minimum: number | undefined, line: number) {
+  if (minimum !== undefined && state.mission.phase < minimum) throw new Error(`第 ${line} 行：API ${name} 将在阶段 ${minimum} 解锁。`)
+}
+
 function programContext(state: SimulationStateV2): ProgramWorldContext {
   return {
     readSensor(name, args, line) {
+      requireApiPhase(state, name, SENSOR_UNLOCK_PHASE[name], line)
       if (name === 'farm_zone') return state.entities.filter((candidate) => candidate.kind === 'crop').map((candidate) => candidate.id)
       if (name === 'is_ripe') {
         const target = findEntity(state, validateString(args[0], line, '地块'))
@@ -290,6 +350,7 @@ function programContext(state: SimulationStateV2): ProgramWorldContext {
       throw new Error(`第 ${line} 行：API ${name} 不存在或尚未解锁。`)
     },
     createAction(name, args, line) {
+      requireApiPhase(state, name, ACTION_UNLOCK_PHASE[name], line)
       if (name === 'move_to') {
         const target = validateString(args[0], line, '目标')
         const point = pointForTarget(state, target)
@@ -348,12 +409,16 @@ function completeDroneAction(state: SimulationStateV2, action: DroneAction) {
     state.drone.y = action.to.y
     if (loaded) state.drone.loadedDistance += distance
     else state.drone.emptyDistance += distance
-    if (loaded && cargoAmount(state, 'xenograin') > 0) state.metrics.xenograinDistance += distance
+    const carriedGrain = cargoAmount(state, 'xenograin')
+    if (loaded && carriedGrain > 0) state.metrics.xenograinDistance += distance * carriedGrain
     state.drone.pathHistory.push({ ...action.to, loaded, ageMs: 0 })
   } else if (action.kind === 'harvest') {
     const plot = state.entities.find((candidate) => candidate.kind === 'crop' && candidate.x === state.drone.x && candidate.y === state.drone.y)
     if (plot?.cropStage === 'ripe' && state.drone.capacity - cargoAmount(state) >= 1) {
-      changeCargo(state, 'xenograin', 1)
+      // Harvest yields two seeds and immediately spends one to replant this
+      // early-game plot, so Cargo gains one net Xenograin.
+      changeCargo(state, 'xenograin', 2)
+      changeCargo(state, 'xenograin', -1)
       plot.cropGrowth = 0
       plot.cropStage = 'planted'
       emit(state, { type: 'cropStage', entityId: plot.id, stage: 'planted' })
@@ -386,6 +451,7 @@ function completeDroneAction(state: SimulationStateV2, action: DroneAction) {
       if (moved > 0) {
         changeCargo(state, action.item, -moved)
         change(target.outputs, action.item, moved)
+        if (action.item === 'xenograin') state.metrics.xenograinDelivered += moved
         if (!state.mission.completedObjectives.includes('first-unload')) state.mission.completedObjectives.push('first-unload')
       }
     }
@@ -450,6 +516,11 @@ function acceptItem(state: SimulationStateV2, target: EntityV2, item: ItemId) {
     target.cycle = 0
     return true
   }
+  if (target.kind === 'hopper') {
+    if (amount(target.outputs, item) >= amount(target.outputCapacity, item)) return false
+    change(target.outputs, item, 1)
+    return true
+  }
   if (amount(target.inputs, item) >= amount(target.inputCapacity, item)) return false
   change(target.inputs, item, 1)
   return true
@@ -471,7 +542,14 @@ function updateProducers(state: SimulationStateV2, dt: number) {
 function updateInserters(state: SimulationStateV2, dt: number) {
   for (const arm of state.entities) {
     if (arm.kind !== 'inserter') continue
-    const target = arm.targetId ? findEntity(state, arm.targetId) : undefined
+    let target = arm.targetId ? findEntity(state, arm.targetId) : undefined
+    if (!target) {
+      const adjacent = adjacentEntity(state, arm)
+      if (adjacent && !['crop', 'ruin', 'belt', 'inserter'].includes(adjacent.kind)) {
+        target = adjacent
+        arm.targetId = adjacent.id
+      }
+    }
     if (!target) {
       arm.status = 'offline'
       continue
@@ -508,14 +586,26 @@ function updateBelts(state: SimulationStateV2, dt: number) {
     const items = belt.beltItems ?? []
     for (const item of items) item.progress = Math.min(1, item.progress + dt / 1_350)
     items.sort((a, b) => b.progress - a.progress)
-    const target = belt.targetId ? findEntity(state, belt.targetId) : undefined
+    let target = belt.targetId ? findEntity(state, belt.targetId) : undefined
+    if (!target) {
+      const adjacent = adjacentEntity(state, belt)
+      if (isLogisticsTarget(adjacent)) {
+        target = adjacent
+        belt.targetId = adjacent?.id
+      }
+    }
     for (const item of [...items].filter((candidate) => candidate.progress >= 1)) {
-      if (target && acceptItem(state, target, item.item)) items.splice(items.indexOf(item), 1)
+      if (target && acceptItem(state, target, item.item)) {
+        items.splice(items.indexOf(item), 1)
+        const transfers = belt.throughputTimes ?? (belt.throughputTimes = [])
+        transfers.push(state.timeMs)
+      }
       else {
         belt.status = 'blocked'
         anyBlocked = true
       }
     }
+    if (belt.throughputTimes) belt.throughputTimes = belt.throughputTimes.filter((time) => time >= state.timeMs - 60_000)
     if (!items.length) belt.status = 'idle'
     else if (belt.status !== 'blocked') belt.status = 'working'
   }
@@ -584,13 +674,14 @@ function phaseAdvance(state: SimulationStateV2, phase: 2 | 3 | 4 | 5 | 6) {
 
 function updateMission(state: SimulationStateV2, dt: number) {
   if (state.mission.phase === 1 && state.mission.completedObjectives.includes('first-harvest') && state.mission.completedObjectives.includes('first-unload')) phaseAdvance(state, 2)
-  if (state.mission.phase === 2 && state.runtime.instructionCount > 5 && /while\s+True\s*:/.test(state.runtime.source) && /for\s+\w+\s+in\s+farm_zone\(\)/.test(state.runtime.source) && /is_ripe\s*\(/.test(state.runtime.source)) phaseAdvance(state, 3)
+  if (state.mission.phase === 2 && state.runtime.instructionCount > 5 && state.runtime.usedSensors?.includes('farm_zone') && state.runtime.usedSensors.includes('is_ripe') && /while\s+True\s*:/.test(state.runtime.source) && /for\s+\w+\s+in\s+farm_zone\(\)/.test(state.runtime.source)) phaseAdvance(state, 3)
   if (state.mission.phase === 3 && state.mission.completedObjectives.includes('first-gel') && state.mission.completedObjectives.includes('first-fiber')) phaseAdvance(state, 4)
   if (state.mission.phase === 4 && state.runtime.instructionCount > 5 && state.runtime.usedSensors?.includes('need') && state.metrics.coresDelivered >= 1) phaseAdvance(state, 5)
   if (state.mission.phase !== 5) return
   const totalDistance = state.drone.emptyDistance + state.drone.loadedDistance
   const emptyPercent = totalDistance > 0 ? state.drone.emptyDistance / totalDistance : 1
-  const qualifies = state.metrics.coresDelivered >= 6 && recentCoresPerMinute(state) >= 1 && emptyPercent < 0.35 && state.power.stability >= 90
+  const demandDriven = state.runtime.usedSensors?.includes('need') ?? false
+  const qualifies = demandDriven && state.metrics.coresDelivered >= 6 && recentCoresPerMinute(state) >= 1 && emptyPercent < 0.35 && state.power.stability >= 90
   state.mission.stabilityMs = qualifies ? state.mission.stabilityMs + dt : 0
   if (state.mission.stabilityMs >= 90_000) {
     state.mission.sandboxUnlocked = true
@@ -617,23 +708,22 @@ export function advanceSimulation(state: SimulationStateV2, dt = SIM_STEP_MS) {
   updateMission(state, dt)
 }
 
-function resetStability(state: SimulationStateV2) {
+function resetStability(state: SimulationStateV2, action: Extract<SimulationEvent, { type: 'worldEdited' }>['action'] = 'program', target?: EntityV2) {
   state.mission.stabilityMs = 0
-  emit(state, { type: 'worldEdited' })
+  emit(state, { type: 'worldEdited', action, entityId: target?.id, x: target?.x, y: target?.y })
 }
 
-function occupied(state: SimulationStateV2, x: number, y: number) {
-  return x < 0 || y < 0 || x >= MAP_WIDTH || y >= MAP_HEIGHT || state.entities.some((candidate) => x >= candidate.x && x < candidate.x + candidate.width && y >= candidate.y && y < candidate.y + candidate.height)
+function occupied(state: SimulationStateV2, x: number, y: number, width = 1, height = 1) {
+  return x < 0 || y < 0 || x + width > MAP_WIDTH || y + height > MAP_HEIGHT || state.entities.some((candidate) => x < candidate.x + candidate.width && x + width > candidate.x && y < candidate.y + candidate.height && y + height > candidate.y)
 }
 
-function addBuilding(state: SimulationStateV2, kind: EntityKind, x: number, y: number) {
+function addBuilding(state: SimulationStateV2, kind: EntityKind, x: number, y: number, direction: Direction = 'east') {
   const unlocked = UNLOCKED_BUILDINGS_BY_PHASE[state.mission.phase] ?? []
   const cost = BUILD_COSTS[kind]
-  if (!unlocked.includes(kind) || cost === undefined || state.credits < cost || occupied(state, x, y)) return
-  state.credits -= cost
-  const id = `${kind}-${state.tick}-${state.entities.length}`
   const extras: Partial<EntityV2> = kind === 'belt'
-    ? { beltItems: [] }
+    ? { beltItems: [], autoConnect: true, direction }
+    : kind === 'inserter'
+      ? { autoConnect: true, direction }
     : kind === 'hopper'
       ? { outputCapacity: { xenograin: 12, water: 12, crystite: 12, gel: 12, biofiber: 12, core: 12 } }
       : kind === 'gelRefinery'
@@ -646,12 +736,16 @@ function addBuilding(state: SimulationStateV2, kind: EntityKind, x: number, y: n
               ? { width: 2, height: 2, outputCapacity: { water: 8 } }
               : kind === 'crystiteDrill'
                 ? { width: 2, height: 2, outputCapacity: { crystite: 8 } }
-                : {}
-  if (kind === 'inserter' && x === 11 && y === 6) Object.assign(extras, { sourceId: 'gel_input', targetId: 'gel_refinery', name: 'gel feed arm' })
-  if (kind === 'inserter' && x === 11 && y === 11) Object.assign(extras, { sourceId: 'fiber_input', targetId: 'fiber_mill', name: 'fiber feed arm' })
+              : {}
+  if (!unlocked.includes(kind) || cost === undefined || state.credits < cost || occupied(state, x, y, extras.width ?? 1, extras.height ?? 1)) return
+  state.credits -= cost
+  const id = `${kind}-${state.tick}-${state.entities.length}`
+  if (kind === 'inserter' && x === 11 && y === 6) Object.assign(extras, { autoConnect: false, sourceId: 'gel_input', targetId: 'gel_refinery', name: 'gel feed arm' })
+  if (kind === 'inserter' && x === 11 && y === 11) Object.assign(extras, { autoConnect: false, sourceId: 'fiber_input', targetId: 'fiber_mill', name: 'fiber feed arm' })
   const built = entity(id, typeof extras.name === 'string' ? extras.name : id, kind, x, y, extras.width ?? 1, extras.height ?? 1, extras)
   state.entities.push(built)
-  resetStability(state)
+  refreshAutoConnections(state)
+  resetStability(state, 'build', built)
 }
 
 export function applyGameCommand(state: SimulationStateV2, command: GameCommand): SimulationStateV2 {
@@ -663,7 +757,7 @@ export function applyGameCommand(state: SimulationStateV2, command: GameCommand)
   else if (command.type === 'selectEntity') state.selectedEntityId = command.entityId
   else if (command.type === 'loadProgram') {
     state.runtime = createProgramRuntime(command.source)
-    resetStability(state)
+    resetStability(state, 'program')
   } else if (command.type === 'runProgram') {
     if (state.runtime.mode === 'complete' || state.runtime.mode === 'error') state.runtime = resetProgramRuntime(state.runtime)
     if (state.runtime.compiled) state.runtime.mode = 'running'
@@ -680,24 +774,27 @@ export function applyGameCommand(state: SimulationStateV2, command: GameCommand)
     state.drone.status = 'idle'
   } else if (command.type === 'moveEntity') {
     const target = findEntity(state, command.entityId)
-    if (target && !occupied({ ...state, entities: state.entities.filter((candidate) => candidate.id !== target.id) }, command.x, command.y)) {
+    if (target && !occupied({ ...state, entities: state.entities.filter((candidate) => candidate.id !== target.id) }, command.x, command.y, target.width, target.height)) {
       target.x = command.x
       target.y = command.y
-      resetStability(state)
+      refreshAutoConnections(state)
+      resetStability(state, 'move', target)
     }
   } else if (command.type === 'rotateEntity') {
     const target = findEntity(state, command.entityId)
     if (target) {
       target.direction = DIRECTIONS[(DIRECTIONS.indexOf(target.direction) + 1) % DIRECTIONS.length]
-      resetStability(state)
+      refreshAutoConnections(state)
+      resetStability(state, 'rotate', target)
     }
-  } else if (command.type === 'build') addBuilding(state, command.kind, command.x, command.y)
+  } else if (command.type === 'build') addBuilding(state, command.kind, command.x, command.y, command.direction)
   else if (command.type === 'demolish') {
     const target = findEntity(state, command.entityId)
     if (target && !target.id.includes('plot') && target.kind !== 'uplink' && target.id !== 'home') {
       state.entities = state.entities.filter((candidate) => candidate !== target)
       state.credits += Math.floor((BUILD_COSTS[target.kind] ?? 0) * 0.8)
-      resetStability(state)
+      refreshAutoConnections(state)
+      resetStability(state, 'demolish', target)
     }
   } else if (command.type === 'setSetting') {
     if (command.key === 'volume' && typeof command.value === 'number') state.settings.volume = Math.max(0, Math.min(1, command.value))
@@ -725,6 +822,9 @@ export function createRenderSnapshot(state: SimulationStateV2): RenderSnapshot {
       cropStage: candidate.cropStage,
       cropGrowth: candidate.cropGrowth,
       beltItems: candidate.beltItems?.map((item) => ({ ...item })),
+      itemsPerMinute: candidate.kind === 'belt'
+        ? (candidate.throughputTimes ?? []).filter((time) => time >= state.timeMs - 60_000).length * (state.timeMs < 60_000 ? 60_000 / Math.max(1, state.timeMs) : 1)
+        : undefined,
       carriedItem: candidate.carriedItem,
       inputFill: Object.entries(candidate.inputCapacity).reduce((total, [item, capacity]) => total + amount(candidate.inputs, item as ItemId) / Math.max(1, capacity ?? 1), 0),
       outputFill: Object.entries(candidate.outputCapacity).reduce((total, [item, capacity]) => total + amount(candidate.outputs, item as ItemId) / Math.max(1, capacity ?? 1), 0),

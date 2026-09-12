@@ -640,6 +640,7 @@ export function executeProgram(runtime: ProgramRuntime, context: ProgramWorldCon
           frame.pc += 1
           if (action) {
             runtime.pendingAction = true
+            runtime.loopIterations = 0
             return action
           }
         } else {

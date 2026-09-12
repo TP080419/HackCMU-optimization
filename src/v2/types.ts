@@ -60,8 +60,10 @@ export interface EntityV2 extends GridPoint {
   cropGrowth?: number
   cropGrowthRate?: number
   beltItems?: BeltItem[]
+  throughputTimes?: number[]
   sourceId?: string
   targetId?: string
+  autoConnect?: boolean
   carriedItem?: ItemId
   cycle?: number
   decorativeVariant?: number
@@ -203,7 +205,9 @@ export interface MetricsState {
   energyUsed: number
   powerStableMs: number
   totalElapsedMs: number
+  /** Sum of grid-distance multiplied by Xenograin units carried. */
   xenograinDistance: number
+  xenograinDelivered: number
 }
 
 export interface SimulationStateV2 {
@@ -245,7 +249,7 @@ export type GameCommand =
   | { type: 'toggleFlowVision' }
   | { type: 'moveEntity'; entityId: string; x: number; y: number }
   | { type: 'rotateEntity'; entityId: string }
-  | { type: 'build'; kind: EntityKind; x: number; y: number }
+  | { type: 'build'; kind: EntityKind; x: number; y: number; direction?: Direction }
   | { type: 'demolish'; entityId: string }
   | { type: 'setSetting'; key: 'muted' | 'volume' | 'reducedMotion'; value: boolean | number }
   | { type: 'loadState'; state: SimulationStateV2 }
@@ -257,7 +261,7 @@ export type SimulationEvent =
   | { id: string; type: 'coreDelivered'; tick: number; total: number }
   | { id: string; type: 'phaseAdvanced'; tick: number; phase: MissionState['phase'] }
   | { id: string; type: 'programError'; tick: number; message: string; line: number | null }
-  | { id: string; type: 'worldEdited'; tick: number }
+  | { id: string; type: 'worldEdited'; tick: number; action: 'program' | 'build' | 'move' | 'rotate' | 'demolish'; entityId?: string; x?: number; y?: number }
 
 export interface RenderEntity extends GridPoint {
   id: string
@@ -271,6 +275,7 @@ export interface RenderEntity extends GridPoint {
   cropStage?: CropStage
   cropGrowth?: number
   beltItems?: BeltItem[]
+  itemsPerMinute?: number
   carriedItem?: ItemId
   inputFill: number
   outputFill: number

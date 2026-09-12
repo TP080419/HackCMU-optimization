@@ -7,7 +7,7 @@ import { python } from '@codemirror/lang-python'
 import { EditorState, StateEffect, StateField } from '@codemirror/state'
 import { Decoration, EditorView, drawSelection, dropCursor, highlightActiveLine, highlightActiveLineGutter, highlightSpecialChars, keymap, lineNumbers, rectangularSelection } from '@codemirror/view'
 import { parseProgram } from '../program'
-import type { ProgramRuntime } from '../types'
+import type { DroneStateV2, ProgramRuntime } from '../types'
 
 const setExecutingLine = StateEffect.define<number | null>()
 const executingLine = StateField.define({
@@ -83,6 +83,7 @@ const theme = EditorView.theme({
 interface CodeWorkbenchProps {
   source: string
   runtime: ProgramRuntime
+  drone: DroneStateV2
   insertion?: { name: string; nonce: number } | null
   onChange: (source: string) => void
   onRun: () => void
@@ -92,7 +93,7 @@ interface CodeWorkbenchProps {
   onClose: () => void
 }
 
-export function CodeWorkbench({ source, runtime, insertion, onChange, onRun, onPause, onStep, onReset, onClose }: CodeWorkbenchProps) {
+export function CodeWorkbench({ source, runtime, drone, insertion, onChange, onRun, onPause, onStep, onReset, onClose }: CodeWorkbenchProps) {
   const hostRef = useRef<HTMLDivElement>(null)
   const editorRef = useRef<EditorView | null>(null)
   const changeRef = useRef(onChange)
@@ -161,6 +162,7 @@ export function CodeWorkbench({ source, runtime, insertion, onChange, onRun, onP
 
   const frame = runtime.frames[runtime.frames.length - 1]
   const variables = frame ? Object.entries(frame.locals).slice(0, 8) : []
+  const cargo = drone.cargo.length ? drone.cargo.map((stack) => `${stack.item} ×${stack.amount}`).join(' · ') : 'empty'
   return (
     <aside className="code-workbench" aria-label="Drone code workbench">
       <header className="workbench-header">
@@ -186,6 +188,8 @@ export function CodeWorkbench({ source, runtime, insertion, onChange, onRun, onP
           <span>LINE <strong>{runtime.currentLine ?? '—'}</strong></span>
           <span>INSTRUCTIONS <strong>{runtime.instructionCount}</strong></span>
           <span>DEPTH <strong>{runtime.frames.length}</strong></span>
+          <span>POSITION <strong>{drone.x}, {drone.y}</strong></span>
+          <span>CARGO <strong>{cargo}</strong></span>
         </div>
         {runtime.lastError ? <p className="runtime-error">{runtime.lastError}</p> : (
           <p className="sensor-readout">{runtime.lastSensor || '传感器尚未返回数据。点击世界中的机器可插入其名称。'}</p>
