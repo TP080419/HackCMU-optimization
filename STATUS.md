@@ -1,39 +1,24 @@
 # XenoFlow status
 
-## Working
+## V2 core implemented
 
-- Complete fixed 24x14 map and centralized economy/recipe configuration.
-- Deterministic 100 ms production, power, Belt/Splitter/Crate transport, arbitration, and demolition accounting.
-- Safe drone DSL with bounded parser/runtime, deterministic BFS, editor controls, two Demo programs, and runtime diagnostics.
-- Canvas world with visible item transport, progress, ports, statuses, drone movement, selection, build ghosts, and Core pulse.
-- React HUD, pause/1x/2x/4x, paused construction, rotation, demolition, straight Belt drag, objectives, Help, and responsive desktop notice.
-- Rolling 60-second analyzer, Demo baseline/current comparison, scoring, six-Core victory, Retry/Main Menu/Keep Optimizing.
-- Versioned save/Continue, separate Demo/New bests, corrupt-save recovery, error boundary, guarded loop, and hidden-page pause.
-- README, Demo walkthrough, asset decision, and contributor guidance.
+- Git `v1.0` tag protects the original vertical slice; active branch is `v2-core`.
+- Phaser 4.2.1 full-screen 30×18 isometric Sector 01 with camera drag, zoom, focus and responsive cover framing.
+- Original bright alien agriculture art direction, four crop stages, animated Drone, dual-lane items, Inserters and silhouette-distinct machines.
+- Deterministic 100ms `SimulationStateV2` with machine buffers, crop speed variation, mixed Cargo, explicit commands/events and render snapshots.
+- Whitelist Python-like tokenizer / AST / interpreter with variables, control flow, functions, action yielding, budgets and host-environment isolation.
+- CodeMirror 6 workbench with highlighting, completion, execution line, inline diagnostics, stepping and watches.
+- Five-phase Sector 01 progression, unlock-scoped hotbar, movable layout, Flow Vision, snapshot Benchmark, final stability gate and Sandbox unlock.
+- V2-only save namespace, settings, mute/volume/reduced-motion, local synthesized feedback and no runtime network dependencies.
 
 ## Verified
 
-- `npm test`: 21/21 tests passing, including complete New Factory and controlled route-comparison fixtures.
 - `npm run typecheck`: passing.
-- `npm run build`: passing.
-- `npm audit --omit=dev`: zero runtime vulnerabilities.
-- Browser production-build checks at 1440x900 and 1366x768: menu, Demo transport/edit/speed/analyzer/victory, Keep Optimizing, Retry confirmation, Main Menu, reload/Continue, New Factory paused build, pointer mapping, R/Esc, Belt drag, invalid terrain, protected Uplink, demolition, and final analyzer diagnostics.
-- Final browser console: zero errors and zero warnings.
-- Representative screenshots captured under ignored `output/playwright/`.
-- Kenney Tiny Factory and Tiny Farm official archives each inspected once; both CC0, geometric fallback selected.
-
-## Unresolved
-
-- No known local failures.
-- Remote delivery is verified separately by comparing the pushed `main` SHA.
-
-## Key files
-
-- `src/game/config.ts` - canonical map and economy configuration.
-- `src/game/simulation.ts` - deterministic simulation.
-- `src/game/drone.ts` - safe DSL and runtime.
-- `src/App.tsx` - playable shell.
-
-## Next action
-
-- No further implementation work is required; follow `README.md` to run or extend the game.
+- `npm test`: 36/36 passing, including all 21 frozen V1 tests.
+- V2 tests cover parser isolation, deterministic action yielding, save/load continuation, code and layout improvements, actual `need()` execution, explicit Inserter gating, benchmark non-mutation, exact optimization thresholds and 300 Belt / 600 item stress.
+- `npm run build`: passing; launch entry is split from Phaser and CodeMirror chunks.
+- Playwright production checks passed at 1440×900, 1366×768 and 1589×1239 for launch, full world, 58/42 code drawer, first feedback, phase progression, Flow Vision and Benchmark.
+- Real-browser phase 3 remained inert with zero Cores until both glowing Inserter slots were built; the second Inserter unlocked phase 4 and production.
+- Reload/Continue restores the V2 save. Browser console reports zero errors and zero warnings.
+- All observed production requests were local `127.0.0.1` assets; there were no external runtime requests or missing resources.
+- Benchmark observed from one live snapshot: fixed patrol 2 Core/min vs demand-driven 4 Core/min; empty travel 11.8% vs 0%.

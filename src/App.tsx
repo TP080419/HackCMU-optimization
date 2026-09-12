@@ -1,584 +1,440 @@
-import { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
-import {
-  BUILD_ORDER,
-  DEFINITIONS,
-  DEMO_BASELINE_PROGRAM,
-  DEMO_SHORT_PROGRAM,
-  ITEM_LABELS,
-  RAW_PER_CORE,
-  STEP_SECONDS,
-} from './game/config'
-import { resetDrone } from './game/drone'
-import { clearSave, loadGame, readBestResults, recordBest, saveGame, SAVE_KEY } from './game/save'
-import {
-  analyze,
-  applyDroneSource,
-  baselineComparison,
-  createScenario,
-  demolishEntity,
-  entityAt,
-  getMachineStatus,
-  getPowerCapacity,
-  getPowerDemand,
-  getPowerMultiplier,
-  keepOptimizing,
-  markBaseline,
-  placeEntity,
-  placementProblem,
-  rotateEntity,
-  stepSimulation,
-} from './game/simulation'
-import type { BuildableKind, GameState, Orientation, Point, ScenarioMode } from './game/types'
-import { WorldCanvas } from './ui/WorldCanvas'
+import { Component, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
+import { benchmarkImprovement, runBenchmark } from './v2/benchmark'
+import { BASELINE_PROGRAM, LOOP_PROGRAM, PHASES, STARTER_PROGRAM, UNLOCKED_BUILDINGS_BY_PHASE } from './v2/config'
+import { XenoFlowEngine } from './v2/engine'
+import { loadGame, saveGame } from './v2/save'
+import { cloneState, createInitialState } from './v2/simulation'
+import type { BenchmarkResult, EntityKind, ItemId, SimulationEvent, SimulationStateV2 } from './v2/types'
 
-type Screen = 'menu' | 'game'
-type DockTab = 'inspector' | 'drone' | 'analyzer'
+const PhaserWorld = lazy(() => import('./v2/rendering/PhaserWorld').then((module) => ({ default: module.PhaserWorld })))
+const CodeWorkbench = lazy(() => import('./v2/ui/CodeWorkbench').then((module) => ({ default: module.CodeWorkbench })))
 
-function formatTime(seconds: number): string {
-  const minutes = Math.floor(seconds / 60)
-  const remainder = Math.floor(seconds % 60)
-  return `${minutes}:${remainder.toString().padStart(2, '0')}`
+interface ErrorBoundaryState {
+  error: Error | null
 }
 
-function orientationName(orientation: Orientation): string {
-  return ['East', 'South', 'West', 'North'][orientation]
-}
+export class AppErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null }
 
-function entityName(kind: string): string {
-  return kind === 'uplink' ? 'Core Uplink' : DEFINITIONS[kind as BuildableKind]?.name ?? kind
-}
+  static getDerivedStateFromError(error: Error) {
+    return { error }
+  }
 
-interface BoundaryState { error: Error | null }
-export class AppErrorBoundary extends Component<{ children: ReactNode }, BoundaryState> {
-  state: BoundaryState = { error: null }
-  static getDerivedStateFromError(error: Error): BoundaryState { return { error } }
-  componentDidCatch(error: Error, info: ErrorInfo): void { console.error('XenoFlow UI error', error, info) }
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('XenoFlow runtime failed', error, info)
+  }
+
   render() {
     if (!this.state.error) return this.props.children
     return (
       <main className="fatal-screen">
-        <p className="eyebrow">SYSTEM RECOVERY</p>
-        <h1>The command console encountered an error.</h1>
-        <p>Your latest good save is still in this browser. Reload to recover it in paused mode.</p>
-        <pre>{this.state.error.message}</pre>
-        <button className="primary" onClick={() => window.location.reload()}>Reload XenoFlow</button>
+        <span className="eyebrow">SECTOR RENDER FAILURE</span>
+        <h1>世界渲染暂时中断</h1>
+        <p>{this.state.error.message}</p>
+        <button type="button" onClick={() => location.reload()}>重新载入 Sector 01</button>
       </main>
     )
   }
 }
 
-function TopHud({ state, mutate, onMenu }: { state: GameState; mutate: (fn: (state: GameState) => void, save?: boolean) => void; onMenu: () => void }) {
-  const analysis = analyze(state)
-  const demand = getPowerDemand(state)
-  const capacity = getPowerCapacity(state)
-  const throttle = getPowerMultiplier(state)
+const BUILD_META: Partial<Record<EntityKind, { label: string; hint: string; cost: number }>> = {
+  belt: { label: '双轨输送带', hint: '连续运输两个通道的物品', cost: 2 },
+  inserter: { label: '机械臂', hint: '在机器与物流之间实体搬运', cost: 9 },
+  hopper: { label: '缓冲仓', hint: '批量接收无人机投递', cost: 14 },
+  waterExtractor: { label: '取水器', hint: '从水面提取 Water', cost: 35 },
+  crystiteDrill: { label: '晶体钻机', hint: '开采 Crystite', cost: 45 },
+  gelRefinery: { label: '营养胶精炼机', hint: '2 Grain + Water → Gel', cost: 60 },
+  fiberMill: { label: '生物纤维磨坊', hint: 'Grain + Crystite → Biofiber', cost: 65 },
+  coreAssembler: { label: '核心组装机', hint: 'Gel + Biofiber → Core', cost: 100 },
+  pylon: { label: '太阳能塔', hint: '提高供电容量', cost: 50 },
+}
+
+const ITEM_LABELS: Record<ItemId, string> = {
+  xenograin: 'Xenograin',
+  water: 'Water',
+  crystite: 'Crystite',
+  gel: 'Nutrient Gel',
+  biofiber: 'Biofiber',
+  core: 'Terraform Core',
+}
+
+function formatTime(milliseconds: number) {
+  const seconds = Math.floor(milliseconds / 1000)
+  return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
+}
+
+function cargoTotal(state: SimulationStateV2) {
+  return state.drone.cargo.reduce((total, stack) => total + stack.amount, 0)
+}
+
+function coreRate(state: SimulationStateV2) {
+  const recent = state.metrics.coreProductionTimes.filter((time) => time >= state.timeMs - 60_000).length
+  return state.timeMs < 60_000 ? recent * (60_000 / Math.max(1, state.timeMs)) : recent
+}
+
+function emptyTravel(state: SimulationStateV2) {
+  const total = state.drone.emptyDistance + state.drone.loadedDistance
+  return total > 0 ? (state.drone.emptyDistance / total) * 100 : 0
+}
+
+function eventTone(event: SimulationEvent) {
+  if (event.type === 'coreDelivered') return [680, 0.22] as const
+  if (event.type === 'phaseAdvanced') return [520, 0.28] as const
+  if (event.type === 'machineCycle') return [220, 0.08] as const
+  if (event.type === 'droneAction' && event.action === 'harvest') return [360, 0.07] as const
+  return null
+}
+
+function BuildingGlyph({ kind }: { kind: EntityKind }) {
+  if (kind === 'belt') return <svg viewBox="0 0 40 40"><path d="M5 13h30v14H5z"/><path d="m11 17 5 3-5 3m9-6 5 3-5 3m9-6 5 3-5 3"/></svg>
+  if (kind === 'inserter') return <svg viewBox="0 0 40 40"><circle cx="11" cy="29" r="6"/><path d="m11 24 8-13 9 7 6-5m-8 5 5 7"/></svg>
+  if (kind === 'hopper') return <svg viewBox="0 0 40 40"><path d="M7 8h26l-5 16-6 3v6h-5v-6l-6-3z"/></svg>
+  if (kind === 'waterExtractor') return <svg viewBox="0 0 40 40"><circle cx="20" cy="21" r="12"/><circle cx="20" cy="21" r="6"/><path d="M20 9V4m8 9 5-4"/></svg>
+  if (kind === 'crystiteDrill') return <svg viewBox="0 0 40 40"><path d="m20 4 8 13-8 19-8-19z"/><path d="M8 30h24"/></svg>
+  if (kind === 'gelRefinery') return <svg viewBox="0 0 40 40"><rect x="7" y="6" width="26" height="29" rx="8"/><path d="M12 21h16M20 10v22"/><circle cx="20" cy="22" r="7"/></svg>
+  if (kind === 'fiberMill') return <svg viewBox="0 0 40 40"><rect x="5" y="8" width="30" height="25" rx="4"/><circle cx="14" cy="20" r="6"/><circle cx="27" cy="20" r="6"/><path d="M14 14v12m13-12v12"/></svg>
+  if (kind === 'coreAssembler') return <svg viewBox="0 0 40 40"><path d="m20 3 15 9v17l-15 8-15-8V12z"/><path d="m20 10 8 10-8 10-8-10z"/></svg>
+  return <svg viewBox="0 0 40 40"><path d="M14 35h12l-3-24h-6zM9 17h22M6 8h28"/><circle cx="20" cy="6" r="4"/></svg>
+}
+
+function LaunchScreen({ hasSave, onStart, onContinue }: { hasSave: boolean; onStart: () => void; onContinue: () => void }) {
   return (
-    <header className="top-hud">
-      <button className="brand-button" onClick={onMenu} aria-label="Save and return to main menu">
-        <span className="brand-mark">X</span><span><b>XENOFLOW</b><small>{state.scenario === 'demo' ? 'INSTANT DEMO' : 'NEW FACTORY'}</small></span>
-      </button>
-      <div className="hud-stat"><span>Credits</span><strong>₡ {state.credits}</strong></div>
-      <div className={`hud-stat ${demand > capacity ? 'danger' : ''}`}><span>Power</span><strong>{demand} / {capacity}</strong><small>{throttle < 1 ? `${Math.round(throttle * 100)}% throttle` : 'stable'}</small></div>
-      <div className="hud-stat core-stat"><span>Cores delivered</span><strong>{state.stats.delivered} <i>/ 6</i></strong></div>
-      <div className="hud-stat"><span>Sim time</span><strong>{formatTime(state.simulatedTime)}</strong></div>
-      <div className="hud-stat"><span>Efficiency</span><strong>{analysis.warmingUp ? 'WARMING UP' : `${analysis.efficiency.toFixed(1)}%`}</strong></div>
-      <div className="speed-controls" aria-label="Simulation speed controls">
-        <button className={state.paused ? 'active' : ''} onClick={() => mutate((draft) => { draft.paused = !draft.paused })}>{state.paused ? '▶ Resume' : 'Ⅱ Pause'}</button>
-        {([1, 2, 4] as const).map((speed) => <button key={speed} className={!state.paused && state.speed === speed ? 'active' : ''} onClick={() => mutate((draft) => { draft.speed = speed; draft.paused = false })}>{speed}×</button>)}
-      </div>
-    </header>
-  )
-}
-
-function Objectives({ state, mutate, onHelp }: { state: GameState; mutate: (fn: (state: GameState) => void, save?: boolean) => void; onHelp: () => void }) {
-  const objectives = [
-    { label: 'Place Crop Plots', done: state.entities.some((entity) => entity.kind === 'crop') },
-    { label: 'Harvest Xenograin', done: state.stats.harvested > 0 },
-    { label: 'Produce Water + Crystite', done: state.stats.producedBy.water > 0 && state.stats.producedBy.crystite > 0 },
-    { label: 'Produce Gel + Biofiber', done: state.stats.producedBy.gel > 0 && state.stats.producedBy.biofiber > 0 },
-    { label: 'Assemble a Core', done: state.stats.producedBy.core > 0 },
-    { label: 'Deliver 6 Cores', done: state.stats.delivered >= 6 },
-  ]
-  const complete = objectives.filter((objective) => objective.done).length
-  return (
-    <section className="objective-strip" aria-label="Mission objectives">
-      <button className="collapse-button" onClick={() => mutate((draft) => { draft.settings.objectivesCollapsed = !draft.settings.objectivesCollapsed })} aria-expanded={!state.settings.objectivesCollapsed}>
-        <span className="objective-kicker">MISSION // TERRAFORM</span>
-        <strong>{complete}/{objectives.length} objectives</strong>
-        <span>{state.settings.objectivesCollapsed ? '▾' : '▴'}</span>
-      </button>
-      {!state.settings.objectivesCollapsed && <div className="objective-items">
-        {objectives.map((objective) => <span key={objective.label} className={objective.done ? 'done' : ''}><i>{objective.done ? '✓' : '○'}</i>{objective.label}</span>)}
-      </div>}
-      <button className="text-button" onClick={onHelp}>Help & recipes</button>
-    </section>
-  )
-}
-
-function InspectorPanel({ state, selectedId, mutate, setSelected, setTool }: {
-  state: GameState
-  selectedId: string | null
-  mutate: (fn: (state: GameState) => void, save?: boolean) => void
-  setSelected(id: string | null): void
-  setTool(kind: 'demolish'): void
-}) {
-  const selected = state.entities.find((entity) => entity.id === selectedId)
-  if (!selected) return (
-    <div className="empty-panel">
-      <div className="radar-icon">⌖</div>
-      <h3>No tile selected</h3>
-      <p>Click a machine, belt, or terrain tile to inspect it. Output ports are marked by arrows.</p>
-      <div className="legend"><span><i className="dot working"/> working</span><span><i className="dot starved"/> starved</span><span><i className="dot blocked"/> blocked</span></div>
-    </div>
-  )
-  const status = getMachineStatus(state, selected)
-  const definition = selected.kind === 'uplink' ? null : DEFINITIONS[selected.kind]
-  const inputEntries = Object.entries(selected.input).filter(([, count]) => (count ?? 0) > 0)
-  return (
-    <div className="panel-stack">
-      <div className="inspector-heading"><div className="machine-glyph">{definition?.abbreviation ?? 'UP'}</div><div><p className="eyebrow">ENTITY {selected.id.toUpperCase()}</p><h2>{entityName(selected.kind)}</h2></div></div>
-      <div className={`status-chip ${status.status.toLowerCase().replace(' ', '-')}`}><i />{status.status}{status.missing ? ` — missing ${ITEM_LABELS[status.missing]}` : ''}</div>
-      <dl className="data-grid">
-        <div><dt>Coordinates</dt><dd>{selected.x}, {selected.y}</dd></div>
-        <div><dt>Facing</dt><dd>{orientationName(selected.orientation)}</dd></div>
-        <div><dt>Power</dt><dd>{definition?.power ?? 0}</dd></div>
-        <div><dt>Progress</dt><dd>{selected.progress.toFixed(1)}s</dd></div>
-      </dl>
-      <section className="buffer-box"><h3>Buffers</h3>{inputEntries.length === 0 && !selected.output && selected.items.length === 0 ? <p className="muted">Empty</p> : <>
-        {inputEntries.map(([item, count]) => <p key={item}><span className={`item-dot ${item}`} />{ITEM_LABELS[item as keyof typeof ITEM_LABELS]} <b>× {count}</b></p>)}
-        {selected.items.length > 0 && <p>Stored items <b>× {selected.items.length}/20</b></p>}
-        {selected.output && <p><span className={`item-dot ${selected.output}`} />Output: {ITEM_LABELS[selected.output]}</p>}
-        {selected.batch && <p>Reserved batch in progress</p>}
-      </>}</section>
-      {definition && <p className="description">{definition.description}</p>}
-      {selected.kind !== 'uplink' && <div className="button-row">
-        <button onClick={() => mutate((draft) => { rotateEntity(draft, selected.id) })}>Rotate (R)</button>
-        <button className="danger-button" onClick={() => { setTool('demolish'); setSelected(null) }}>Demolish tool</button>
-      </div>}
-    </div>
-  )
-}
-
-function DronePanel({ state, source, setSource, mutate, notify }: {
-  state: GameState
-  source: string
-  setSource(value: string): void
-  mutate: (fn: (state: GameState) => void, save?: boolean) => void
-  notify(message: string, error?: boolean): void
-}) {
-  const apply = () => {
-    const result = applyDroneSource(state, source)
-    if (!result.ok) notify(result.error, true)
-    else {
-      mutate(() => undefined)
-      notify('Program validated and installed.')
-    }
-  }
-  return (
-    <div className="panel-stack drone-panel">
-      <div className="drone-readout">
-        <div><span>Position</span><strong>{state.drone.x}, {state.drone.y}</strong></div>
-        <div><span>Cargo</span><strong>{state.drone.cargo} / {state.drone.capacity}</strong></div>
-        <div><span>Distance</span><strong>{state.drone.distance} tiles</strong></div>
-      </div>
-      {state.scenario === 'demo' && <div className="program-presets">
-        <button onClick={() => setSource(DEMO_BASELINE_PROGRAM)}>Load baseline</button>
-        <button onClick={() => setSource(DEMO_SHORT_PROGRAM)}>Load shorter route</button>
-      </div>}
-      <label className="code-label" htmlFor="drone-source"><span>DRONE PROGRAM</span><small>{source.split('\n').length}/200 lines</small></label>
-      <textarea id="drone-source" spellCheck={false} value={source} onChange={(event) => setSource(event.target.value)} aria-describedby="drone-command-help" />
-      <div className="button-row">
-        <button className="primary" onClick={apply}>Apply & Run</button>
-        <button onClick={() => mutate((draft) => { draft.drone.paused = !draft.drone.paused; draft.drone.message = draft.drone.paused ? 'Drone paused by operator.' : 'Drone resumed.' })}>{state.drone.paused ? 'Resume Drone' : 'Pause Drone'}</button>
-        <button onClick={() => mutate((draft) => resetDrone(draft.drone))}>Reset</button>
-      </div>
-      <div className={`runtime-readout ${state.drone.error ? 'error' : ''}`}>
-        <span>{state.drone.currentLine ? `LINE ${state.drone.currentLine}` : 'RUNTIME'}</span>
-        <code>{state.drone.currentText || state.drone.message}</code>
-        {state.drone.currentText && <small>{state.drone.message}</small>}
-      </div>
-      <details id="drone-command-help" className="command-help">
-        <summary>Command reference</summary>
-        <code>MOVE_TO x y</code><p>Fly to a tile (1 tile/s).</p>
-        <code>HARVEST</code><p>Harvest the Crop Plot beneath the drone.</p>
-        <code>DROP x y [1–4]</code><p>Unload into an adjacent compatible input side.</p>
-        <code>WAIT 0.1–60</code><p>Wait in simulated seconds.</p>
-        <code>REPEAT 1–100 … END</code><p>Repeat a safe block.</p>
-        <code>LOOP … END</code><p>Repeat forever. Lines beginning with # are comments.</p>
-        <p className="muted">For New Factory, replace fixture coordinates with the tiles you actually build. Toggle coordinates below the map and click tiles in Inspect Coordinates mode.</p>
-      </details>
-    </div>
-  )
-}
-
-function AnalyzerPanel({ state, mutate, setSelected, notify }: {
-  state: GameState
-  mutate: (fn: (state: GameState) => void, save?: boolean) => void
-  setSelected(id: string | null): void
-  notify(message: string, error?: boolean): void
-}) {
-  const analysis = analyze(state)
-  const comparison = baselineComparison(state)
-  const assembler = state.entities.find((entity) => entity.kind === 'coreAssembler')
-  const assemblerDurations = assembler ? analysis.machineDurations[assembler.id] : undefined
-  return (
-    <div className="panel-stack analyzer-panel">
-      <div className="efficiency-ring" style={{ '--value': `${Math.max(0, Math.min(100, analysis.efficiency)) * 3.6}deg` } as React.CSSProperties}>
-        <div><strong>{analysis.warmingUp ? '—' : analysis.efficiency.toFixed(0)}</strong><span>{analysis.warmingUp ? 'WARMING UP' : 'EFFICIENCY'}</span></div>
-      </div>
-      <dl className="data-grid">
-        <div><dt>Cores / min</dt><dd>{analysis.coreRate.toFixed(2)}</dd></div>
-        <div><dt>Window</dt><dd>{analysis.elapsedWindow.toFixed(1)}s / 60s</dd></div>
-        <div><dt>Drone travel</dt><dd>{Math.round(analysis.travelFraction * 100)}%</dd></div>
-        <div><dt>Item retention</dt><dd>{Math.round(analysis.retention * 100)}%</dd></div>
-      </dl>
-      {assemblerDurations && <div className="duration-bar" title="Assembler state durations in the active window">
-        {Object.entries(assemblerDurations).map(([status, seconds]) => seconds > 0 && <span key={status} className={status.toLowerCase().replace(' ', '-')} style={{ width: `${seconds / analysis.elapsedWindow * 100}%` }} />)}
-      </div>}
-      <section className="diagnoses"><h3>Measured bottlenecks</h3>
-        {analysis.elapsedWindow < 15 ? <p className="collecting">Collecting data… {analysis.elapsedWindow.toFixed(1)}/15s minimum</p> : analysis.diagnoses.length ? analysis.diagnoses.map((diagnosis, index) => (
-          <button key={`${diagnosis.text}-${index}`} onClick={() => diagnosis.entityId && setSelected(diagnosis.entityId)}><span>{index + 1}</span>{diagnosis.text}</button>
-        )) : <p className="good-news">No material bottleneck in the current window.</p>}
-      </section>
-      {state.scenario === 'demo' && <section className="comparison-card"><p className="eyebrow">TEMPORARY ROUTE COMPARISON</p>
-        {!state.baseline ? <>
-          <p>After a full 60-second window, mark the current measured throughput and travel share.</p>
-          <button disabled={analysis.elapsedWindow < 60} onClick={() => mutate((draft) => { if (!markBaseline(draft)) notify('Collect a full 60-second window first.', true); else notify('Baseline marked. Apply an edited route next.') })}>Mark baseline</button>
-        </> : comparison.ready && comparison.before && comparison.current ? <>
-          <div className="comparison-values"><span>Before<b>{comparison.before.throughput.toFixed(2)} cores/min</b><small>{Math.round(comparison.before.travelFraction * 100)}% travel</small></span><span>Current<b>{comparison.current.throughput.toFixed(2)} cores/min</b><small>{Math.round(comparison.current.travelFraction * 100)}% travel</small></span></div>
-          <p className={comparison.current.throughput > comparison.before.throughput ? 'good-news' : 'muted'}>Δ {(comparison.current.throughput - comparison.before.throughput).toFixed(2)} cores/min · {Math.round((comparison.current.travelFraction - comparison.before.travelFraction) * 100)} pts travel</p>
-          <button onClick={() => mutate((draft) => { draft.baseline = null })}>Clear comparison</button>
-        </> : <><p className="collecting">{comparison.reason}</p><button onClick={() => mutate((draft) => { draft.baseline = null })}>Clear baseline</button></>}
-      </section>}
-      <details className="score-formula"><summary>Why this score?</summary><p>Efficiency = throughput × (80% + 10% power stability + 10% item retention). Throughput reaches 100% at 2 Cores/min. Retention is an item-event proxy, not physical mass balance.</p></details>
-    </div>
-  )
-}
-
-function Palette({ state, buildKind, demolish, selectBuild, selectDemolish, orientation }: {
-  state: GameState
-  buildKind: BuildableKind | null
-  demolish: boolean
-  selectBuild(kind: BuildableKind): void
-  selectDemolish(): void
-  orientation: Orientation
-}) {
-  return (
-    <section className="palette" aria-label="Construction palette">
-      <div className="palette-header"><span>BUILD // {orientationName(orientation).toUpperCase()}</span><small>Click to place · drag straight belts · R rotate · Esc cancel</small></div>
-      <div className="palette-grid">
-        {BUILD_ORDER.map((kind) => {
-          const definition = DEFINITIONS[kind]
-          const disabled = state.credits < definition.cost
-          return <button key={kind} className={buildKind === kind ? 'selected' : ''} onClick={() => selectBuild(kind)} title={definition.description} aria-pressed={buildKind === kind}>
-            <i style={{ background: definition.color }}>{definition.abbreviation}</i><span><b>{definition.name}</b><small>₡{definition.cost} {definition.power > 0 ? `· ⚡${definition.power}` : ''}</small></span>{disabled && <em>LOW</em>}
-          </button>
-        })}
-        <button className={`demolish-tool ${demolish ? 'selected' : ''}`} onClick={selectDemolish} aria-pressed={demolish}><i>×</i><span><b>Demolish</b><small>80% refund</small></span></button>
-      </div>
-    </section>
-  )
-}
-
-function HelpDialog({ onClose }: { onClose(): void }) {
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title">
-    <button className="modal-close" onClick={onClose} aria-label="Close help">×</button>
-    <p className="eyebrow">FIELD MANUAL // 01</p><h1 id="help-title">Turn alien soil into Terraform Cores.</h1>
-    <div className="help-grid">
-      <div><h2>The chain</h2><p>Build on the marked terrain. Water and Crystite travel on belts. Your drone harvests Xenograin and drops it into the refinery and mill. Route their outputs into the Core Assembler, then belt Cores into the protected Uplink.</p><div className="recipe-list"><p><b>Gel Refinery</b><span>2 Xenograin + 1 Water → 1 Gel · 6s</span></p><p><b>Fiber Mill</b><span>1 Xenograin + 2 Crystite → 1 Biofiber · 8s</span></p><p><b>Core Assembler</b><span>2 Gel + 1 Biofiber → 1 Core · 12s</span></p><p className="raw-total"><b>Per Core</b><span>{RAW_PER_CORE.xenograin} Xenograin + {RAW_PER_CORE.water} Water + {RAW_PER_CORE.crystite} Crystite</span></p></div></div>
-      <div><h2>Controls</h2><ul><li><kbd>R</kbd> rotate selected build or machine</li><li><kbd>Esc</kbd> cancel construction</li><li><kbd>Space</kbd> pause / resume</li><li><kbd>1</kbd><kbd>2</kbd><kbd>4</kbd> simulation speed</li></ul><h2>Optimization loop</h2><p>Watch real items move, open Analyzer for measured shortages and travel share, then change only what the evidence supports. Demo includes a deliberately wasteful drone route and a shorter teaching example.</p><p className="muted">No network calls occur during gameplay. Progress is saved locally after meaningful changes and every five simulated seconds.</p></div>
-    </div><button className="primary" onClick={onClose}>Return to factory</button>
-  </section></div>
-}
-
-function VictoryDialog({ state, onKeep, onRetry, onMenu, notify }: { state: GameState; onKeep(): void; onRetry(): void; onMenu(): void; notify(message: string, error?: boolean): void }) {
-  const victory = state.victory!
-  const resultText = `XenoFlow ${state.scenario === 'demo' ? 'Instant Demo' : 'New Factory'} — ${victory.score} points, ${formatTime(victory.completionSeconds)}, ${victory.efficiency.toFixed(1)}% efficiency, ₡${victory.creditsRemaining} remaining, ${victory.travelDistance} drone tiles, ${victory.discarded} discarded.`
-  const copy = async () => {
-    try { await navigator.clipboard.writeText(resultText); notify('Result copied to clipboard.') }
-    catch { notify('Clipboard unavailable. Select the result text below and copy it manually.', true) }
-  }
-  return <div className="modal-backdrop"><section className="modal victory-modal" role="dialog" aria-modal="true" aria-labelledby="victory-title">
-    <div className="victory-orbit"><span>6</span></div><p className="eyebrow">TERRAFORM LINK ESTABLISHED</p><h1 id="victory-title">Six Cores delivered.</h1><p>The colony has enough power to begin atmospheric conversion. Your original result is frozen below.</p>
-    <div className="score-display"><span>FINAL SCORE</span><strong>{victory.score.toLocaleString()}</strong></div>
-    <dl className="victory-stats"><div><dt>Efficiency</dt><dd>{victory.efficiency.toFixed(1)}%</dd></div><div><dt>Completion</dt><dd>{formatTime(victory.completionSeconds)}</dd></div><div><dt>Credits</dt><dd>₡{victory.creditsRemaining}</dd></div><div><dt>Travel</dt><dd>{victory.travelDistance} tiles</dd></div><div><dt>Discarded</dt><dd>{victory.discarded}</dd></div></dl>
-    {victory.bottlenecks.length > 0 && <div className="victory-bottlenecks"><b>Measured bottlenecks</b>{victory.bottlenecks.map((text) => <p key={text}>{text}</p>)}</div>}
-    <textarea className="result-fallback" readOnly value={resultText} aria-label="Selectable result text" />
-    <div className="button-row centered"><button className="primary" onClick={onKeep}>Keep Optimizing</button><button onClick={onRetry}>Retry</button><button onClick={onMenu}>Main Menu</button><button onClick={copy}>Copy Result</button></div>
-  </section></div>
-}
-
-export default function App() {
-  const gameRef = useRef<GameState | null>(null)
-  const [screen, setScreen] = useState<Screen>('menu')
-  const [, setRevision] = useState(0)
-  const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [buildKind, setBuildKind] = useState<BuildableKind | null>(null)
-  const [demolish, setDemolish] = useState(false)
-  const [orientation, setOrientation] = useState<Orientation>(0)
-  const [hover, setHover] = useState<Point | null>(null)
-  const [dragPath, setDragPath] = useState<Point[]>([])
-  const [dockTab, setDockTab] = useState<DockTab>('inspector')
-  const [editorSource, setEditorSource] = useState('')
-  const [helpOpen, setHelpOpen] = useState(false)
-  const [toast, setToast] = useState<{ message: string; error: boolean } | null>(null)
-  const [saveStatus, setSaveStatus] = useState(() => loadGame(window.localStorage))
-  const [bestResults, setBestResults] = useState(() => readBestResults(window.localStorage))
-  const lastSavedTime = useRef(0)
-  const recordedVictory = useRef<number | null>(null)
-
-  const notify = useCallback((message: string, error = false) => {
-    setToast({ message, error })
-    window.setTimeout(() => setToast((current) => current?.message === message ? null : current), 3500)
-  }, [])
-
-  const persist = useCallback((state: GameState) => {
-    const result = saveGame(window.localStorage, state)
-    if (!result.ok) {
-      state.notice = result.message
-      notify(result.message, true)
-    } else {
-      lastSavedTime.current = state.simulatedTime
-      setSaveStatus({ ok: true, state })
-    }
-  }, [notify])
-
-  const mutate = useCallback((fn: (state: GameState) => void, shouldSave = true) => {
-    const state = gameRef.current
-    if (!state) return
-    fn(state)
-    if (shouldSave) persist(state)
-    setRevision((value) => value + 1)
-  }, [persist])
-
-  const startScenario = useCallback((scenario: ScenarioMode, bypassConfirmation = false) => {
-    const hasSaved = window.localStorage.getItem(SAVE_KEY) !== null
-    if (!bypassConfirmation && hasSaved && !window.confirm('Start a new run and replace the saved factory?')) return
-    const state = createScenario(scenario)
-    gameRef.current = state
-    setEditorSource(state.drone.source)
-    setSelectedId(null); setBuildKind(null); setDemolish(false); setDockTab('inspector')
-    recordedVictory.current = null
-    setScreen('game')
-    persist(state)
-    setRevision((value) => value + 1)
-  }, [persist])
-
-  const continueSaved = useCallback(() => {
-    const loaded = loadGame(window.localStorage)
-    setSaveStatus(loaded)
-    if (!loaded.ok) return
-    gameRef.current = loaded.state
-    setEditorSource(loaded.state.drone.source)
-    recordedVictory.current = loaded.state.victory?.score ?? null
-    setScreen('game')
-    setRevision((value) => value + 1)
-  }, [])
-
-  const returnToMenu = useCallback(() => {
-    const state = gameRef.current
-    if (state) { state.paused = true; persist(state) }
-    setScreen('menu')
-    setSaveStatus(loadGame(window.localStorage))
-    setBestResults(readBestResults(window.localStorage))
-  }, [persist])
-
-  useEffect(() => {
-    if (screen !== 'game') return
-    let frame = 0
-    let last = performance.now()
-    let lastUi = last
-    let accumulator = 0
-    const run = (now: number) => {
-      const state = gameRef.current
-      const delta = (now - last) / 1000
-      last = now
-      try {
-        if (state && !state.paused) {
-          if (delta > 3) {
-            state.paused = true
-            state.notice = 'Simulation paused after a long rendering stall; no elapsed production was invented.'
-            accumulator = 0
-          } else {
-            accumulator += Math.min(delta, 0.25) * state.speed
-            let steps = 0
-            while (accumulator + 0.000001 >= STEP_SECONDS && steps < 80) {
-              stepSimulation(state)
-              accumulator -= STEP_SECONDS
-              steps += 1
-              if (state.paused) { accumulator = 0; break }
-            }
-            if (steps >= 80 && accumulator >= STEP_SECONDS) {
-              state.paused = true
-              state.notice = 'Catch-up limit reached. Simulation paused to keep the browser responsive.'
-              accumulator = 0
-            }
-            if (state.simulatedTime - lastSavedTime.current >= 5) persist(state)
-          }
-          if (state.victory && recordedVictory.current !== state.victory.score) {
-            recordedVictory.current = state.victory.score
-            const result = recordBest(window.localStorage, state)
-            if (result.ok) setBestResults(result.results)
-            else notify(result.message, true)
-            persist(state)
-          }
-        } else accumulator = 0
-      } catch (error) {
-        if (state) {
-          state.paused = true
-          state.notice = `Simulation recovered from an error: ${error instanceof Error ? error.message : String(error)}`
-          notify(state.notice, true)
-          persist(state)
-        }
-      }
-      if (now - lastUi >= 200) { setRevision((value) => value + 1); lastUi = now }
-      frame = requestAnimationFrame(run)
-    }
-    const onVisibility = () => {
-      if (document.hidden && gameRef.current) {
-        gameRef.current.paused = true
-        gameRef.current.notice = 'Paused because the page was hidden.'
-        persist(gameRef.current)
-        setRevision((value) => value + 1)
-      }
-    }
-    document.addEventListener('visibilitychange', onVisibility)
-    frame = requestAnimationFrame(run)
-    return () => { cancelAnimationFrame(frame); document.removeEventListener('visibilitychange', onVisibility) }
-  }, [screen, notify, persist])
-
-  useEffect(() => {
-    if (screen !== 'game') return
-    const onKey = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null
-      if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable) return
-      const state = gameRef.current
-      if (!state) return
-      if (event.key.toLowerCase() === 'r') {
-        event.preventDefault()
-        if (buildKind) setOrientation((value) => ((value + 1) % 4) as Orientation)
-        else if (selectedId) mutate((draft) => { rotateEntity(draft, selectedId) })
-      } else if (event.key === 'Escape') {
-        setBuildKind(null); setDemolish(false); setDragPath([])
-      } else if (event.code === 'Space') {
-        event.preventDefault(); mutate((draft) => { draft.paused = !draft.paused })
-      } else if (event.key === '1' || event.key === '2' || event.key === '4') {
-        const speed = Number(event.key) as 1 | 2 | 4
-        mutate((draft) => { draft.speed = speed; draft.paused = false })
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [screen, buildKind, selectedId, mutate])
-
-  const state = gameRef.current
-  const hoveredProblem = useMemo(() => {
-    if (!state || !hover) return null
-    if (demolish) {
-      const target = entityAt(state, hover.x, hover.y)
-      return !target ? 'Nothing to demolish.' : target.protected ? 'Core Uplink is protected.' : `Demolish ${entityName(target.kind)} for ₡${target.kind === 'belt' ? 1 : Math.floor(DEFINITIONS[target.kind as BuildableKind].cost * 0.8)}.`
-    }
-    if (buildKind) return placementProblem(state, buildKind, hover.x, hover.y) ?? `Place ${DEFINITIONS[buildKind].name} at ${hover.x},${hover.y}.`
-    return `Tile ${hover.x},${hover.y}`
-  }, [state, hover, demolish, buildKind])
-
-  if (screen === 'menu') {
-    return <main className="menu-screen">
-      <div className="menu-grid" aria-hidden="true" />
-      <section className="menu-hero">
-        <div className="menu-logo"><span className="brand-mark large">X</span><div><p>COLONY SYSTEMS // CMU</p><h1>XENOFLOW</h1></div></div>
-        <p className="menu-tagline">Harvest alien soil. Route real materials.<br/>Program one drone. Find the bottleneck.</p>
-        <div className="menu-actions">
-          <button className="primary large-action" onClick={() => startScenario('demo')}><span>INSTANT DEMO</span><small>Run a prebuilt chain with a fixable route</small></button>
-          <button className="large-action" onClick={() => startScenario('new')}><span>NEW FACTORY</span><small>500 credits · empty map · build your own</small></button>
-          <button className="large-action" disabled={!saveStatus.ok} onClick={continueSaved}><span>CONTINUE</span><small>{saveStatus.ok ? `${saveStatus.state.scenario === 'demo' ? 'Demo' : 'New Factory'} · ${formatTime(saveStatus.state.simulatedTime)} · paused on load` : saveStatus.message}</small></button>
-          <button className="text-action" onClick={() => setHelpOpen(true)}>HOW TO PLAY <span>→</span></button>
+    <main className="launch-screen">
+      <div className="launch-art" />
+      <div className="launch-vignette" />
+      <section className="launch-copy">
+        <div className="brand-lockup">
+          <span className="brand-mark">X</span>
+          <span>XENOFLOW</span>
         </div>
-        {!saveStatus.ok && saveStatus.kind !== 'missing' && <div className="save-warning"><b>Saved data needs attention.</b><p>{saveStatus.message}</p><button onClick={() => { if (window.confirm('Delete the unreadable saved factory? This cannot be undone.')) { clearSave(window.localStorage); setSaveStatus(loadGame(window.localStorage)) } }}>Reset saved data</button></div>}
-        <div className="best-results"><p className="eyebrow">LOCAL BEST RESULTS</p><span>Demo <b>{bestResults.demo ? `${bestResults.demo.score.toLocaleString()} · ${formatTime(bestResults.demo.seconds)}` : '—'}</b></span><span>New Factory <b>{bestResults.new ? `${bestResults.new.score.toLocaleString()} · ${formatTime(bestResults.new.seconds)}` : '—'}</b></span></div>
+        <span className="eyebrow">SECTOR 01 // THE LIVING LINE</span>
+        <h1>让农场读懂<br />工厂的饥饿。</h1>
+        <p>编写一架农业无人机，让它观察成熟度与实时需求；再重排实体产线，把一次收获变成持续吞吐。</p>
+        <div className="launch-actions">
+          <button className="launch-primary" type="button" onClick={hasSave ? onContinue : onStart}>{hasSave ? '继续 Sector 01' : '启动 Sector 01'}</button>
+          {hasSave && <button className="launch-secondary" type="button" onClick={onStart}>从头开始</button>}
+        </div>
+        <div className="launch-features">
+          <span><b>01</b> 确定性模拟</span>
+          <span><b>02</b> 安全 Python-like</span>
+          <span><b>03</b> 同快照 Benchmark</span>
+        </div>
       </section>
-      <aside className="menu-visual" aria-hidden="true"><div className="planet"><div className="orbit one"/><div className="orbit two"/><div className="planet-core"/></div><div className="flow-line line-a"/><div className="flow-line line-b"/><div className="menu-label label-a">WATER FEED // READY</div><div className="menu-label label-b">DRONE LINK // ONLINE</div><div className="menu-label label-c">CORE UPLINK // WAITING</div></aside>
-      <footer className="menu-footer"><span>LOCAL SIMULATION</span><span>NO NETWORK REQUIRED</span><span>BUILD 1.0</span></footer>
-      {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
+      <span className="launch-build">V2 CORE / LOCAL BUILD</span>
     </main>
-  }
-
-  if (!state) return null
-  const selected = state.entities.find((entity) => entity.id === selectedId)
-  const tileAction = (point: Point) => {
-    if (state.settings.showCoordinates && !buildKind && !demolish) {
-      const text = `${point.x} ${point.y}`
-      navigator.clipboard?.writeText(text).then(() => notify(`Coordinates ${text} copied.`)).catch(() => notify(`Coordinates: ${text}`))
-      return
-    }
-    if (demolish) {
-      const target = entityAt(state, point.x, point.y)
-      if (!target) { notify('Nothing to demolish.', true); return }
-      mutate((draft) => {
-        const result = demolishEntity(draft, target.id)
-        if (!result.ok) notify(result.reason, true)
-        else notify(`Demolished ${entityName(target.kind)}: +₡${result.refund}${result.discarded ? `, ${result.discarded} item(s) discarded` : ''}.`)
-      })
-      return
-    }
-    if (buildKind && buildKind !== 'belt') {
-      mutate((draft) => {
-        const result = placeEntity(draft, buildKind, point.x, point.y, orientation)
-        if (!result.ok) notify(result.reason, true)
-        else { setSelectedId(result.entity.id); notify(`${DEFINITIONS[buildKind].name} placed.`) }
-      })
-      return
-    }
-    const target = entityAt(state, point.x, point.y)
-    setSelectedId(target?.id ?? null)
-    setDockTab('inspector')
-  }
-
-  const placeBeltPath = (path: Point[], beltOrientation: Orientation) => {
-    mutate((draft) => {
-      let placed = 0
-      let firstError: string | null = null
-      const unique = path.filter((point, index) => path.findIndex((other) => other.x === point.x && other.y === point.y) === index)
-      for (const point of unique) {
-        const existing = entityAt(draft, point.x, point.y)
-        if (existing?.kind === 'belt') continue
-        const result = placeEntity(draft, 'belt', point.x, point.y, beltOrientation)
-        if (result.ok) placed += 1
-        else if (!firstError) firstError = `${point.x},${point.y}: ${result.reason}`
-      }
-      if (placed) notify(`Placed ${placed} belt${placed === 1 ? '' : 's'} for ₡${placed}.`)
-      else notify(firstError ?? 'No new belt tiles were needed.', !!firstError)
-    })
-  }
-
-  return <main className="game-screen">
-    <div className="size-notice"><b>XenoFlow needs a desktop-sized window.</b><span>Use at least 1180 × 720 CSS pixels to keep the full map and controls visible.</span></div>
-    <TopHud state={state} mutate={mutate} onMenu={returnToMenu} />
-    <div className="game-layout">
-      <section className="world-column">
-        <Objectives state={state} mutate={mutate} onHelp={() => setHelpOpen(true)} />
-        <div className="canvas-frame">
-          <WorldCanvas stateRef={gameRef} selectedId={selectedId} hover={hover} buildKind={buildKind} orientation={orientation} dragPath={dragPath} demolish={demolish} onHover={setHover} onDragPreview={(path, facing) => { setDragPath(path); setOrientation(facing) }} onTileAction={tileAction} onBeltDrag={placeBeltPath} />
-          <div className="map-corner tl"/><div className="map-corner tr"/><div className="map-corner bl"/><div className="map-corner br"/>
-        </div>
-        <div className={`map-status ${hoveredProblem?.includes('requires') || hoveredProblem?.includes('occupied') || hoveredProblem?.includes('protected') || hoveredProblem?.includes('Need ') ? 'invalid' : ''}`}><span>{hoveredProblem ?? 'Select a build tool or click the map to inspect.'}</span><button className={state.settings.showCoordinates ? 'active' : ''} onClick={() => mutate((draft) => { draft.settings.showCoordinates = !draft.settings.showCoordinates })}>⌖ {state.settings.showCoordinates ? 'Inspect Coordinates ON' : 'Show Coordinates'}</button></div>
-        <Palette state={state} buildKind={buildKind} demolish={demolish} orientation={orientation} selectBuild={(kind) => { setBuildKind(kind); setDemolish(false); setSelectedId(null) }} selectDemolish={() => { setDemolish(true); setBuildKind(null); setSelectedId(null) }} />
-      </section>
-      <aside className="right-dock">
-        <nav className="dock-tabs" aria-label="Factory tools">
-          {(['inspector', 'drone', 'analyzer'] as const).map((tab) => <button key={tab} className={dockTab === tab ? 'active' : ''} onClick={() => setDockTab(tab)}>{tab}{tab === 'analyzer' && analyze(state).diagnoses.length > 0 ? <i>{analyze(state).diagnoses.length}</i> : null}</button>)}
-        </nav>
-        <div className="dock-content">
-          {dockTab === 'inspector' && <InspectorPanel state={state} selectedId={selected?.id ?? null} mutate={mutate} setSelected={setSelectedId} setTool={() => { setDemolish(true); setBuildKind(null) }} />}
-          {dockTab === 'drone' && <DronePanel state={state} source={editorSource} setSource={setEditorSource} mutate={mutate} notify={notify} />}
-          {dockTab === 'analyzer' && <AnalyzerPanel state={state} mutate={mutate} setSelected={(id) => { setSelectedId(id); setDockTab('inspector') }} notify={notify} />}
-        </div>
-        <div className="dock-footer"><span className={state.paused ? 'paused' : 'online'}><i />{state.paused ? 'SIM PAUSED' : `SIM ONLINE · ${state.speed}×`}</span><span>AUTOSAVE {Math.max(0, Math.floor(state.simulatedTime - lastSavedTime.current))}s</span></div>
-      </aside>
-    </div>
-    {state.notice && <button className="system-notice" onClick={() => mutate((draft) => { draft.notice = null })}><b>SYSTEM NOTICE</b>{state.notice}<span>×</span></button>}
-    {toast && <div className={`toast ${toast.error ? 'error' : ''}`} role="status">{toast.message}</div>}
-    {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
-    {state.victory && !state.victoryAcknowledged && <VictoryDialog state={state} notify={notify} onKeep={() => mutate((draft) => keepOptimizing(draft))} onRetry={() => startScenario(state.scenario)} onMenu={returnToMenu} />}
-  </main>
+  )
 }
+
+interface BenchmarkPanelProps {
+  baseline: BenchmarkResult | null
+  candidate: BenchmarkResult | null
+  running: boolean
+  onClose: () => void
+  onRun: () => void
+}
+
+function BenchmarkPanel({ baseline, candidate, running, onClose, onRun }: BenchmarkPanelProps) {
+  const improvement = baseline && candidate ? benchmarkImprovement(baseline, candidate) : null
+  const rows: Array<[string, keyof BenchmarkResult, string]> = [
+    ['Core / min', 'coresPerMinute', '越高越好'],
+    ['空载移动', 'emptyTravelPercent', '越低越好'],
+    ['Grain 格距 / 单位', 'xenograinDistancePerUnit', '越低越好'],
+    ['Refinery 缺料', 'refineryStarvedPercent', '越低越好'],
+    ['Mill 缺料', 'millStarvedPercent', '越低越好'],
+    ['Belt 堵塞', 'beltBlockedPercent', '越低越好'],
+    ['能耗', 'energyUsed', '越低越好'],
+  ]
+  return (
+    <section className="benchmark-panel" aria-label="Benchmark comparison">
+      <header>
+        <div><span className="eyebrow">DETERMINISTIC / 120 SIM SEC</span><h2>同快照 Benchmark</h2></div>
+        <button className="icon-button" type="button" onClick={onClose}>×</button>
+      </header>
+      <p>复制当前世界，从完全相同的 tick 分别运行基线与当前程序；不会修改正式存档。</p>
+      <div className="benchmark-summary">
+        <div><span>产量变化</span><strong>{improvement ? `${improvement.outputGain >= 0 ? '+' : ''}${improvement.outputGain}%` : '—'}</strong></div>
+        <div><span>空载减少</span><strong>{improvement ? `${improvement.emptyReduction >= 0 ? '+' : ''}${improvement.emptyReduction}%` : '—'}</strong></div>
+      </div>
+      <div className="benchmark-table">
+        <div className="benchmark-row benchmark-head"><span>指标</span><span>初始程序</span><span>当前程序</span></div>
+        {rows.map(([label, key, hint]) => (
+          <div className="benchmark-row" key={key} title={hint}>
+            <span>{label}</span>
+            <b>{baseline ? String(baseline[key]) : '—'}{String(key).includes('Percent') ? '%' : ''}</b>
+            <b>{candidate ? String(candidate[key]) : '—'}{String(key).includes('Percent') ? '%' : ''}</b>
+          </div>
+        ))}
+      </div>
+      <button className="primary-action benchmark-run" type="button" disabled={running} onClick={onRun}>{running ? '正在模拟 2 × 120 秒…' : '从当前快照重新运行'}</button>
+    </section>
+  )
+}
+
+function App() {
+  const savedAtBoot = useMemo(() => loadGame(), [])
+  const engine = useMemo(() => new XenoFlowEngine(savedAtBoot ?? createInitialState()), [savedAtBoot])
+  const [revision, setRevision] = useState(0)
+  const [entered, setEntered] = useState(false)
+  const [codeOpen, setCodeOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [benchmarkOpen, setBenchmarkOpen] = useState(false)
+  const [benchmarkRunning, setBenchmarkRunning] = useState(false)
+  const [baseline, setBaseline] = useState<BenchmarkResult | null>(null)
+  const [candidate, setCandidate] = useState<BenchmarkResult | null>(null)
+  const [buildTool, setBuildTool] = useState<EntityKind | null>(null)
+  const [codeSource, setCodeSource] = useState(engine.getState().runtime.source)
+  const [insertion, setInsertion] = useState<{ name: string; nonce: number } | null>(null)
+  const [toast, setToast] = useState('')
+  const lastEventId = useRef('')
+  const audioRef = useRef<AudioContext | null>(null)
+  const state = engine.getState()
+  void revision
+
+  useEffect(() => engine.subscribe(() => setRevision((value) => value + 1)), [engine])
+
+  useEffect(() => {
+    let frame = 0
+    let previous = performance.now()
+    const loop = (now: number) => {
+      engine.dispatch({ type: 'advance', elapsedMs: now - previous })
+      previous = now
+      frame = requestAnimationFrame(loop)
+    }
+    frame = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(frame)
+  }, [engine])
+
+  useEffect(() => {
+    if (!entered || state.tick === 0 || state.tick % 50 !== 0) return
+    saveGame(state)
+  }, [entered, state, state.tick])
+
+  const playTone = useCallback((frequency: number, duration: number) => {
+    const current = engine.getState()
+    if (current.settings.muted || current.settings.volume <= 0) return
+    const AudioCtor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+    if (!AudioCtor) return
+    const audio = audioRef.current ?? new AudioCtor()
+    audioRef.current = audio
+    void audio.resume()
+    const oscillator = audio.createOscillator()
+    const gain = audio.createGain()
+    oscillator.type = 'sine'
+    oscillator.frequency.setValueAtTime(frequency, audio.currentTime)
+    gain.gain.setValueAtTime(current.settings.volume * 0.08, audio.currentTime)
+    gain.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + duration)
+    oscillator.connect(gain).connect(audio.destination)
+    oscillator.start()
+    oscillator.stop(audio.currentTime + duration)
+  }, [engine])
+
+  useEffect(() => {
+    const event = state.events[state.events.length - 1]
+    if (!event || event.id === lastEventId.current) return
+    lastEventId.current = event.id
+    const tone = eventTone(event)
+    if (tone) playTone(tone[0], tone[1])
+    if (event.type === 'phaseAdvanced') {
+      const phase = PHASES[event.phase - 1]
+      setToast(`新阶段：${phase.title}`)
+      const timer = window.setTimeout(() => setToast(''), 3_800)
+      return () => window.clearTimeout(timer)
+    }
+  }, [playTone, state.events])
+
+  useEffect(() => {
+    const selected = state.entities.find((entity) => entity.id === state.selectedEntityId)
+    if (!codeOpen || !selected || ['crop', 'belt', 'inserter', 'ruin'].includes(selected.kind)) return
+    setInsertion({ name: selected.name, nonce: performance.now() })
+  }, [codeOpen, state.selectedEntityId])
+
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null
+      const typing = Boolean(target?.closest('input, textarea, [contenteditable="true"], .cm-editor'))
+      if (event.key === 'Escape') {
+        setBuildTool(null)
+        setSettingsOpen(false)
+      }
+      if (!typing && event.key.toLowerCase() === 'b' && !event.ctrlKey && !event.metaKey && engine.getState().mission.phase >= 4) setBenchmarkOpen((open) => !open)
+    }
+    window.addEventListener('keydown', keydown)
+    return () => window.removeEventListener('keydown', keydown)
+  }, [engine])
+
+  const startFresh = () => {
+    const fresh = createInitialState(STARTER_PROGRAM)
+    engine.dispatch({ type: 'loadState', state: fresh })
+    saveGame(fresh)
+    setCodeSource(STARTER_PROGRAM)
+    setEntered(true)
+    playTone(440, 0.16)
+  }
+
+  const continueGame = () => {
+    setEntered(true)
+    setCodeSource(engine.getState().runtime.source)
+    playTone(440, 0.16)
+  }
+
+  const runCode = () => {
+    if (codeSource !== state.runtime.source) engine.dispatch({ type: 'loadProgram', source: codeSource })
+    engine.dispatch({ type: 'runProgram' })
+    playTone(460, 0.06)
+  }
+
+  const useLoopExample = () => {
+    setCodeSource(BASELINE_PROGRAM)
+    engine.dispatch({ type: 'loadProgram', source: BASELINE_PROGRAM })
+    setCodeOpen(true)
+  }
+
+  const useDemandExample = () => {
+    setCodeSource(LOOP_PROGRAM)
+    engine.dispatch({ type: 'loadProgram', source: LOOP_PROGRAM })
+    setCodeOpen(true)
+  }
+
+  const runBenchmarks = () => {
+    setBenchmarkRunning(true)
+    window.setTimeout(() => {
+      const snapshot = cloneState(engine.getState())
+      setBaseline(runBenchmark(snapshot, BASELINE_PROGRAM))
+      setCandidate(runBenchmark(snapshot, codeSource))
+      setBenchmarkRunning(false)
+      playTone(620, 0.16)
+    }, 20)
+  }
+
+  const toggleFullscreen = async () => {
+    if (document.fullscreenElement) await document.exitFullscreen()
+    else await document.documentElement.requestFullscreen()
+  }
+
+  if (!entered) return <LaunchScreen hasSave={Boolean(savedAtBoot)} onStart={startFresh} onContinue={continueGame} />
+
+  const phase = PHASES[state.mission.phase - 1]
+  const selected = state.entities.find((entity) => entity.id === state.selectedEntityId)
+  const unlocked = UNLOCKED_BUILDINGS_BY_PHASE[state.mission.phase] ?? []
+  const topLines = Object.entries(state.runtime.lineCosts).sort((a, b) => b[1] - a[1]).slice(0, 3)
+  const totalCargo = cargoTotal(state)
+  return (
+    <main className={`game-shell ${codeOpen ? 'code-is-open' : ''} ${state.settings.reducedMotion ? 'reduced-motion' : ''}`}>
+      <div className="world-stage">
+        <Suspense fallback={<div className="world-loading"><span>正在建立 Sector 01…</span></div>}>
+          <PhaserWorld engine={engine} buildTool={buildTool} onToggleCode={() => setCodeOpen((open) => !open)} />
+        </Suspense>
+        <div className="world-shade" />
+
+        <header className="floating-hud">
+          <div className="hud-brand" title="XenoFlow V2">
+            <span className="brand-mark small">X</span>
+            <span><b>XENOFLOW</b><small>THE LIVING LINE</small></span>
+          </div>
+          <div className="resource-strip">
+            <span><small>CREDITS</small><b>₡ {state.credits}</b></span>
+            <span><small>CORE</small><b>{state.metrics.coresDelivered} / 6</b></span>
+            <span><small>CARGO</small><b>{totalCargo} / {state.drone.capacity}</b></span>
+            <span><small>POWER</small><b className={state.power.stability < 90 ? 'warning-text' : ''}>{Math.round(state.power.demand)} / {state.power.capacity}</b></span>
+          </div>
+          <div className="sim-controls">
+            <button type="button" className="pause-button" onClick={() => engine.dispatch({ type: 'togglePause' })}>{state.paused ? '▶ 继续' : 'Ⅱ 暂停'}</button>
+            {([1, 2, 4] as const).map((speed) => <button className={state.speed === speed ? 'active' : ''} key={speed} type="button" onClick={() => engine.dispatch({ type: 'setSpeed', speed })}>{speed}×</button>)}
+            <span className="sim-clock">{formatTime(state.timeMs)}</span>
+          </div>
+        </header>
+
+        <section className="objective-card">
+          <div className="objective-index">0{state.mission.phase}</div>
+          <div><span className="eyebrow">{phase.title}</span><h2>{phase.objective}</h2><p>{phase.hint}</p></div>
+          {state.mission.phase === 1 && <button className="objective-action" type="button" onClick={() => setCodeOpen(true)}>打开唤醒程序</button>}
+          {state.mission.phase === 2 && <button className="objective-action" type="button" onClick={useLoopExample}>载入循环示例</button>}
+          {state.mission.phase === 4 && <button className="objective-action" type="button" onClick={useDemandExample}>载入需求调度模板</button>}
+          {state.mission.phase === 5 && <div className="stability-meter"><span style={{ width: `${Math.min(100, state.mission.stabilityMs / 900)}%` }} /><b>{Math.floor(state.mission.stabilityMs / 1000)} / 90s</b></div>}
+        </section>
+
+        <nav className="world-tools" aria-label="World tools">
+          <button className={state.flowVision ? 'active' : ''} type="button" onClick={() => engine.dispatch({ type: 'toggleFlowVision' })}><span>⌁</span>Flow Vision <kbd>Tab</kbd></button>
+          <button className={benchmarkOpen ? 'active' : ''} type="button" disabled={state.mission.phase < 4} title={state.mission.phase < 4 ? '接通工厂后解锁' : '从相同快照比较程序'} onClick={() => setBenchmarkOpen((open) => !open)}><span>◫</span>Benchmark <kbd>B</kbd></button>
+          <button className={codeOpen ? 'active' : ''} type="button" onClick={() => setCodeOpen((open) => !open)}><span>{'</>'}</span>Code <kbd>C</kbd></button>
+          <button type="button" onClick={() => void toggleFullscreen()} aria-label="切换全屏">⛶</button>
+          <button type="button" onClick={() => setSettingsOpen((open) => !open)} aria-label="打开设置">⚙</button>
+        </nav>
+
+        {settingsOpen && (
+          <section className="settings-popover">
+            <header><span className="eyebrow">LOCAL SETTINGS</span><button className="icon-button" type="button" onClick={() => setSettingsOpen(false)}>×</button></header>
+            <label><span>音量</span><input type="range" min="0" max="1" step="0.05" value={state.settings.volume} onChange={(event) => engine.dispatch({ type: 'setSetting', key: 'volume', value: Number(event.target.value) })} /></label>
+            <label><span>静音</span><input type="checkbox" checked={state.settings.muted} onChange={(event) => engine.dispatch({ type: 'setSetting', key: 'muted', value: event.target.checked })} /></label>
+            <label><span>Reduced motion</span><input type="checkbox" checked={state.settings.reducedMotion} onChange={(event) => engine.dispatch({ type: 'setSetting', key: 'reducedMotion', value: event.target.checked })} /></label>
+            <small>设置与游戏存档只保存在本浏览器的 xenoflow.v2.* 命名空间。</small>
+          </section>
+        )}
+
+        {selected && (
+          <section className={`context-card status-${selected.status} ${state.flowVision ? 'with-flow' : ''}`}>
+            <header><span className="status-dot" /><div><small>{selected.kind}</small><h3>{selected.name}</h3></div><button className="icon-button" type="button" onClick={() => engine.dispatch({ type: 'selectEntity', entityId: null })}>×</button></header>
+            <div className="context-stats">
+              <span><small>STATUS</small><b>{selected.status}</b></span>
+              <span><small>PROCESS</small><b>{Math.round(selected.progress * 100)}%</b></span>
+            </div>
+            {Object.keys(selected.inputs).length > 0 && <p>输入：{Object.entries(selected.inputs).map(([item, value]) => `${ITEM_LABELS[item as ItemId]} ${value}`).join(' · ')}</p>}
+            {Object.keys(selected.outputs).length > 0 && <p>输出：{Object.entries(selected.outputs).map(([item, value]) => `${ITEM_LABELS[item as ItemId]} ${value}`).join(' · ')}</p>}
+            <footer>
+              <button type="button" onClick={() => engine.dispatch({ type: 'rotateEntity', entityId: selected.id })}>旋转 R</button>
+              {codeOpen && !['crop', 'belt', 'inserter', 'ruin'].includes(selected.kind) && <span>名称已插入代码</span>}
+            </footer>
+          </section>
+        )}
+
+        {state.flowVision && (
+          <section className="flow-card">
+            <header><span className="eyebrow">FLOW VISION</span><strong>{coreRate(state).toFixed(1)} Core/min</strong></header>
+            <div className="flow-metrics">
+              <span><i className="loaded-line" />载货路径 {Math.round(state.drone.loadedDistance)} 格</span>
+              <span><i className="empty-line" />空载路径 {emptyTravel(state).toFixed(1)}%</span>
+            </div>
+            <p>最耗时代码：{topLines.length ? topLines.map(([line, cost]) => `L${line} · ${cost}`).join(' / ') : '运行程序后显示'}</p>
+          </section>
+        )}
+
+        <section className="build-dock">
+          <div className="dock-handle"><span>BUILD // PHASE {state.mission.phase}</span><small>{buildTool ? `正在放置 ${BUILD_META[buildTool]?.label} · Esc 取消` : '拖动镜头 · 滚轮缩放 · Shift 拖动机器 · 双击聚焦'}</small></div>
+          <div className="build-items">
+            {unlocked.length === 0 ? <div className="locked-build-message">完成农业程序后，将解锁实体物流。</div> : unlocked.map((kind) => {
+              const meta = BUILD_META[kind]
+              if (!meta) return null
+              return (
+                <button className={buildTool === kind ? 'selected' : ''} type="button" key={kind} onClick={() => setBuildTool((current) => current === kind ? null : kind)} title={meta.hint}>
+                  <span className="build-icon"><BuildingGlyph kind={kind} /></span>
+                  <span><b>{meta.label}</b><small>₡{meta.cost}</small></span>
+                </button>
+              )
+            })}
+          </div>
+        </section>
+
+        {toast && <div className="world-toast"><span>✓</span>{toast}</div>}
+      </div>
+
+      {codeOpen && (
+        <Suspense fallback={<aside className="code-workbench workbench-loading">正在载入代码工作台…</aside>}>
+          <CodeWorkbench
+            source={codeSource}
+            runtime={state.runtime}
+            insertion={insertion}
+            onChange={setCodeSource}
+            onRun={runCode}
+            onPause={() => engine.dispatch({ type: 'pauseProgram' })}
+            onStep={() => engine.dispatch({ type: 'stepProgram' })}
+            onReset={() => engine.dispatch({ type: 'resetProgram' })}
+            onClose={() => setCodeOpen(false)}
+          />
+        </Suspense>
+      )}
+      {benchmarkOpen && <BenchmarkPanel baseline={baseline} candidate={candidate} running={benchmarkRunning} onClose={() => setBenchmarkOpen(false)} onRun={runBenchmarks} />}
+    </main>
+  )
+}
+
+export default App

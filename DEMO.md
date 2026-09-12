@@ -1,10 +1,19 @@
-# XenoFlow demo walkthrough
+# Sector 01 验收路线
 
-1. Launch the app and choose **Instant Demo**. Point out the Water and Crystite feeds, the two intermediate machines, the Core Assembler, moving Belt items, and the protected Uplink. The documented three-item starting stock lets the first Core complete within 30 simulated seconds; later Cores require the live chain.
-2. Open **Drone**. The shipped baseline performs the same harvest/drop work as the optimized example but contains two needless excursions (`2,12` and `20,12`). Keep the baseline running.
-3. Switch to **Analyzer**. Use 4× speed until the window reaches 60 seconds. Show real Cores/min, drone travel share, machine states, and up to three evidence-based diagnoses, then choose **Mark baseline**.
-4. Return to **Drone**, choose **Load shorter route**, optionally inspect the changed source, then choose **Apply & Run**. No stock, power, resources, or production rules change.
-5. Return to **Analyzer** and use 4× until a new full 60-second window excludes pre-edit data. Show before/current/delta rather than claiming an instant improvement.
-6. Continue to the sixth delivered Core. Show the frozen victory result, then use **Keep Optimizing** to prove the popup does not repeat. Retry asks before replacing saved progress; Main Menu saves and pauses.
+1. 打开页面并启动 `Sector 01`。确认世界填满可用视口，HUD 和任务为悬浮卡片。
+2. 点击“打开唤醒程序”并运行。约 4 秒可以看到 Drone 飞到 `plot-0-0`、收割、Cargo 增加；约 8 秒完成第一次投递并进入阶段 2。
+3. 载入固定循环示例并运行。它会访问所有地块，即使地块尚未成熟；在 4× 下约 15–25 秒进入需求调度阶段。
+4. 打开 Flow Vision：检查黄色缺料端口、世界内 items/min、Drone 两类路径与最耗时代码行。
+5. 载入需求调度模板并运行。观察 `need()` 让 Gel / Fiber 输入交替得到补给。
+6. 打开 Benchmark 并运行。正式状态的 Core 数和时间不应被 2×120 秒模拟修改；当前模板应明显优于固定巡逻。
+7. 选择建造栏设施并在空地放置；Belt 可拖出连续路径。按住 Shift 拖动端点或机器可改变 Drone 距离，`R` 旋转，`Delete` 拆除。
+8. 关闭代码抽屉，确认世界恢复全宽；分别检查 1440×900、1366×768 和大窗口。
+9. 刷新并选择继续，确认 V2 状态恢复；V1 localStorage 键保持原样。
 
-Both Demo programs are editable teaching examples and both eventually complete the mission. **New Factory** begins empty and paused with 500 credits; its starter source illustrates syntax only and must be adapted to the player's actual layout.
+验证命令：
+
+```bash
+npm run typecheck
+npm test
+npm run build
+```

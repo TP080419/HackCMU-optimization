@@ -1,26 +1,26 @@
-# XenoFlow
+# XenoFlow V2 — The Living Line
 
-XenoFlow is a desktop browser game about alien farming, factory logistics, and one programmable harvesting drone. Build a complete production chain, watch every item travel through it, use measured bottleneck evidence, and deliver six Terraform Cores without exceeding the construction budget.
+XenoFlow 是一款本地运行的异星农业 / 工厂自动化编程游戏。玩家不是分别解决“代码题”和“摆产线题”：农业无人机读取作物成熟度与机器实时需求，实体 Hopper、Inserter、双通道 Belt 和多格机器再把同一批物料变成 Terraform Core。
 
-The game is a local-only vertical slice: one fixed 24×14 map, **Instant Demo**, unsolved **New Factory**, a safe drone language, 60-second analyzer, victory scoring, and save/continue. Gameplay makes no network requests.
+当前版本只实现一个 20–30 分钟的核心章节 `Sector 01 — The Living Line` 和通关后的 Sandbox。项目刻意不加入战斗、多人、后端、随机地图、第二架无人机或大型科技树。
 
-## Run locally
+## 本地运行
 
-Requirements: Node.js 20 or newer and npm.
+要求 Node.js 20+ 与 npm。
 
 ```bash
 npm install
 npm run dev
 ```
 
-Open the local URL printed by Vite. To run the exact production output:
+生产构建：
 
 ```bash
 npm run build
 npm run preview
 ```
 
-Verification commands:
+完整验证：
 
 ```bash
 npm run typecheck
@@ -28,115 +28,114 @@ npm test
 npm run build
 ```
 
-## How to play
-
-- Choose a building in the bottom palette, then click a valid tile. Drag to place a straight Belt run.
-- Water Extractors require the cyan Hydro Spring; Crystite Drills require the violet vent; Crop Plots require fertile ground.
-- Face a machine's output toward the next Belt. Machines receive compatible ingredients from their other three sides.
-- Open **Drone**, update the coordinates to match your layout, then choose **Apply & Run**.
-- Open **Analyzer** after the factory has run long enough. It reports measured shortages, blocked transfers, throughput, power stability, retention, and drone travel share.
-- Deliver six Terraform Cores to the protected Uplink.
-
-Keyboard controls:
-
-| Key | Action |
-| --- | --- |
-| `R` | Rotate the active build tool or selected entity |
-| `Esc` | Cancel the active build/demolish tool |
-| `Space` | Pause or resume global simulation |
-| `1`, `2`, `4` | Run at 1×, 2×, or 4× |
-
-Shortcuts are disabled while typing in the drone editor. Construction, inspection, and code editing remain available while the simulation is paused.
-
-## Production chain
-
-There are exactly six item types: Xenograin, Water, Crystite, Nutrient Gel, Biofiber, and Terraform Core.
-
-| Machine | Recipe |
-| --- | --- |
-| Crop Plot | 1 Xenograin every 6s; remains ripe until harvested |
-| Water Extractor | 1 Water every 3s |
-| Crystite Drill | 1 Crystite every 4s |
-| Gel Refinery | 2 Xenograin + 1 Water → 1 Nutrient Gel in 6s |
-| Fiber Mill | 1 Xenograin + 2 Crystite → 1 Biofiber in 8s |
-| Core Assembler | 2 Gel + 1 Biofiber → 1 Terraform Core in 12s |
-
-One Core therefore requires **5 Xenograin, 2 Water, and 2 Crystite**. All costs, power values, recipes, map coordinates, and shipped programs are centralized in `src/game/config.ts`.
-
-Installed power demand is always counted. When demand exceeds capacity, crop and machine speed is multiplied by `capacity / demand`; Belts and the drone retain their normal speed. A Solar Pylon adds 60 capacity.
-
-## Drone language
-
-The language is case-insensitive, ignores `# comments`, and is parsed into instructions; it never evaluates JavaScript.
+## 核心循环
 
 ```text
-LOOP
-  MOVE_TO 3 3
-  HARVEST
-  MOVE_TO 8 6
-  DROP 9 6 4
-  WAIT 1
-END
+观察作物与机器需求
+        ↓
+修改 Python-like 调度程序 ←→ 移动机器、端点和物流
+        ↓
+无人机批量收割 / 混装 / 投递
+        ↓
+Hopper → Inserter → Machine → 双通道 Belt
+        ↓
+在同一世界快照上 Benchmark，再继续优化
 ```
 
-| Command | Meaning |
+生产链固定为六种物品：
+
+```text
+Xenograin + Water → Nutrient Gel
+Xenograin + Crystite → Biofiber
+Gel + Biofiber → Terraform Core
+```
+
+- Crop Plot 具有 `empty → planted → growing → ripe` 生命周期与不同生长速度。
+- 收割获得 2 份 Xenograin，其中 1 份立即用于早期自动回种，因此无人机净装载 1 份；空地仍可通过 `plant()` 明确播种。
+- Drone 容量为 6，Cargo 使用多物品堆栈。
+- 机器有真实输入 / 输出缓存，不能直接从相邻 Belt 吸取物品。
+- Inserter 是机器和物流之间唯一的自动搬运方式。
+- Belt 以两个独立通道运输逐个物品。
+
+## 五步章节
+
+1. **唤醒农田**：运行六行程序，在首次动作后 5 秒内看到无人机收割。
+2. **建立循环**：用 `for`、`while`、`if` 和 `is_ripe()` 替代一次性路线。
+3. **接入工厂**：让 Gel Refinery 与 Fiber Mill 都完成加工，解锁实体建造栏。
+4. **需求调度**：使用 `need()` 解决两台机器争抢 Xenograin 的问题。
+5. **稳定性挑战**：累计交付 6 Core；连续 90 模拟秒保持至少 1 Core/min、空载移动低于 35%、电力稳定不低于 90%。
+
+代码或布局被修改后，稳定性计时会重新开始。完成后只开放 Sector 01 Sandbox。
+
+## 操作
+
+| 操作 | 功能 |
 | --- | --- |
-| `MOVE_TO x y` | Fly by deterministic N/E/S/W BFS at one tile per second |
-| `HARVEST` | Harvest the Crop Plot under the drone |
-| `DROP x y [amount]` | Drop up to 1–4 Xenograin into an adjacent compatible input |
-| `WAIT seconds` | Wait 0.1–60 simulated seconds |
-| `REPEAT count … END` | Repeat a block 1–100 times |
-| `LOOP … END` | Repeat a block forever |
+| 拖动世界 | 平移镜头 |
+| 滚轮 | 缩放镜头 |
+| 双击机器 / 告警 | 聚焦目标 |
+| `Shift` + 拖动机器 | 重新布置机器或输入端点 |
+| 拖动放置 Belt | 建造直角连续 Belt |
+| `R` | 旋转选中实体 |
+| `Delete` | 拆除选中实体（80% 退款） |
+| `Tab` | 开关 Flow Vision |
+| `C` | 开关代码工作台 |
+| `B` | 开关 Benchmark |
+| `Esc` | 取消建造工具 |
 
-Limits are 200 source lines, nesting depth 4, and 64 zero-time control operations per tick. Errors identify the source line and pause only the drone. Applying a program preserves position and cargo; Reset additionally preserves source while clearing runtime state.
+## 安全 Python-like 工作台
 
-## Analyzer and score
+CodeMirror 6 提供行号、Python 高亮、自动缩进、括号补全、世界 API 自动完成、当前执行行、行内诊断和变量观察。
 
-The analyzer aggregates simulation events over the most recent 60 simulated seconds (or the actual shorter duration while warming up). It does not use animation frames or scripted bonuses.
+```python
+while True:
+    for plot in farm_zone():
+        if is_ripe(plot) and cargo_free() > 0:
+            move_to(plot)
+            harvest()
 
-```text
-elapsedWindow = min(60, simulatedSeconds)
-coreRate = deliveredInWindow × 60 / elapsedWindow
-throughput = clamp(coreRate / 2, 0, 1)
-powerStability = 1 - overloadedSecondsInWindow / elapsedWindow
-retention = clamp(1 - discarded / max(1, initialItems + producedItems), 0, 1)
-efficiency = 100 × throughput × (0.8 + 0.1 × powerStability + 0.1 × retention)
+    if need("gel_refinery", XENOGRAIN) >= 2:
+        move_to("gel_input")
+        unload("gel_input", XENOGRAIN, 4)
 ```
 
-Retention is an item-event proxy, not physical mass balance. Machine utilization is informational and does not reduce the score merely because an upstream machine correctly idles.
+支持变量、数字 / 布尔 / 字符串、算术与比较、`if / elif / else`、`for`、`while`、函数、参数与 `return`。世界 API 包括 `move_to`、`harvest`、`plant`、`load`、`unload`、`wait`、`farm_zone`、`is_ripe`、`need`、`cargo_free`、`cargo` 与 `distance_to`。
 
-At the first six-Core delivery:
+运行时使用自有 tokenizer、缩进解析器、白名单 AST 和确定性字节码解释器；没有 `eval`。它拒绝 `import`、属性访问、类、异步、生成器、动态执行和递归，并限制每 tick 指令数、循环次数与调用深度，因此无法访问 JavaScript、DOM、网络或文件系统。
 
-```text
-finalScore = round(efficiency × 100)
-           + 10 × max(0, 360 - floor(completionSeconds))
-           + 2 × creditsRemaining
-           - 20 × discardedItems
-```
+## Flow Vision 与 Benchmark
 
-Instant Demo and New Factory retain separate local best results. The Demo baseline button stores a temporary measured window; comparison remains in “collecting data” until a later full window excludes all pre-edit events.
+`Tab` 将诊断直接放回世界：
 
-## Architecture
+- 产线显示 `items/min`；
+- 缺料输入以黄色脉冲标记，堵塞输出使用红色轮廓；
+- Drone 载货 / 空载轨迹使用不同线型；
+- 工作台统计各行执行成本，Flow Vision 显示最耗时三行；
+- 点击机器才打开上下文卡片。
 
-- `src/game/config.ts` — canonical economy, recipes, map, fixture, and programs.
-- `src/game/simulation.ts` — deterministic 100ms production, transport, power, placement, metrics, and victory rules.
-- `src/game/drone.ts` — parser, bytecode-like instructions, BFS, and bounded runtime.
-- `src/game/save.ts` — versioned JSON save validation and separate best results.
-- `src/rendering/canvas.ts` — 2D world rendering and the five bounded animation families.
-- `src/ui/WorldCanvas.tsx` — pointer/grid mapping and straight Belt drag gestures.
-- `src/App.tsx` — React controls, fixed-step browser loop, persistence, recovery, and screens.
+Benchmark 复制当前完整状态，分别从相同 tick 运行固定巡逻基线和当前程序 120 模拟秒。它比较 Core/min、空载移动、Xenograin 格距、两台机器缺料、Belt 堵塞与能耗，不修改正式存档。测试门槛要求需求驱动程序至少提高 15% 产量并减少 20% 空载移动。
 
-Simulation state uses stable entity IDs and plain serializable data. Transfer resolution is deterministic: readiness is snapshotted, intents are grouped, one claim wins by rotating priority, then commits occur. A newly arrived Belt item waits a full tile-second and cannot cross two tiles in one step.
+## 架构
 
-## Visual assets and accessibility
+- React 19：菜单、悬浮 HUD、任务、建造栏、设置、Benchmark 与 CodeMirror 抽屉。
+- Phaser 4.2.1：100dvw × 100dvh 世界、等距镜头、WebGL / Canvas fallback、输入、实体动画与本地音频反馈。
+- 纯 TypeScript 模拟：严格 100ms 固定步长，不使用 Phaser 物理引擎。
+- Vitest：V1 回归、V2 解释器、确定性、存档、优化门槛与 300 Belt / 600 物品压力场景。
 
-The shipped game uses the original geometric Canvas renderer. The approved Kenney Tiny Factory and Tiny Farm packs were each inspected once and verified as CC0, but their warm 16px pixel style was not mixed into the established dark 32px industrial visual language. See `THIRD_PARTY_ASSETS.md`.
+关键接口位于 `src/v2/types.ts`：`SimulationStateV2`、`GameCommand`、`SimulationEvent`、`RenderSnapshot`、`ProgramAst`、`ProgramRuntime` 与 `BenchmarkResult`。
 
-Controls use accessible labels, keyboard focus is visible, and critical states pair color with text or shape. Reduced-motion preferences disable decorative movement. The full interface targets 1440×900 and 1366×768; windows below 1180×720 show a desktop-size notice.
+边界规则：
 
-## Current limitations
+- React 只提交 `GameCommand`；
+- Phaser 只消费 `RenderSnapshot`，不拥有生产规则；
+- 状态保持 JSON 可序列化；
+- V2 保存键位于 `xenoflow.v2.*`；V1 存档不会被迁移或删除；
+- `src/game/` 中的 V1 模拟与测试保留为冻结回归参考。
 
-- One fixed map and one drone only; New Factory intentionally has no auto-solver.
-- Save data and best results are local to the current browser profile.
-- Desktop browser only; there is no touch/mobile layout, backend, leaderboard, multiplayer, audio, zoom, or live deployment in this repository.
-- Closed full Belt loops may remain jammed by design.
+当前稳定旧版标记为 Git tag `v1.0`，V2 开发位于 `v2-core` 分支。
+
+## 视觉资源
+
+世界采用原创“明亮异星农业 + 实体工业”方向：暖灰岩土、青绿植被、紫色晶体、浅蓝水面、象牙白机壳和铜色机械结构。建筑依靠轮廓与动画区分，不以字母缩写作为主体。
+
+美术标尺 `public/assets/v2/sector-01-art-direction.png` 由 OpenAI ImageGen 为本项目生成；实际可交互实体由 Phaser 本地程序化图形渲染。项目没有捆绑 Kenney 或其他第三方美术资源，运行时不发起外部网络请求。
